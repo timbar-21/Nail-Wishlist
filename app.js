@@ -757,7 +757,7 @@ function designFormBodyHTML() {
     '<div class="form-section"><label class="form-label">Photo</label>' +
       '<label class="photo-picker" id="photo-picker">' +
         (previewSrc ? '<img id="photo-preview" src="' + esc(previewSrc) + '" alt="">' : '<span class="photo-picker-hint" id="photo-hint">Tap to take or choose a photo</span>') +
-        '<input type="file" accept="image/*" capture="environment" id="photo-input"></label></div>' +
+        '<input type="file" accept="image/*" id="photo-input"></label></div>' +
     '<div class="form-section"><label class="form-label">Date</label><input class="form-input" type="date" id="field-date" value="' + esc(formDraft.dateLogged) + '"></div>' +
     '<div class="form-section"><label class="form-label">Rating</label><div class="rating-picker">' +
       RATING_TIERS.map(function (r) {

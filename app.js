@@ -4,17 +4,24 @@
 const STORAGE_KEY = "krista-nail-journal-v1";
 const CLOUD_KEY = "krista-nail-journal-cloud-hash";
 
-/* Cross-device sync via Firebase Firestore + Storage, set up once in a
-   NEW Firebase project (console.firebase.google.com, free tier) — kept
-   separate from any other app's project. Fill in the real values below
-   and re-deploy to turn syncing on; until then FIREBASE_ENABLED stays
-   false and the app runs local-only. This config is meant to be public
-   (that's how Firebase client config works); real access control lives
-   in firestore.rules/storage.rules, which restrict every read/write to
-   paths keyed by the passcode's SHA-256 hash below — the passcode itself
-   never leaves the device, only its hash does. See README.md for setup
-   steps, and double-check the deployed rules in the Firebase console —
-   they can't be verified from this client code alone. */
+/* Cross-device sync via Firebase Firestore, set up once in a NEW Firebase
+   project (console.firebase.google.com, free Spark tier — no billing
+   required) — kept separate from any other app's project. Fill in the
+   real values below and re-deploy to turn syncing on; until then
+   FIREBASE_ENABLED stays false and the app runs local-only. This config
+   is meant to be public (that's how Firebase client config works); real
+   access control lives in firestore.rules, which restricts every read/
+   write to paths keyed by the passcode's SHA-256 hash below — the
+   passcode itself never leaves the device, only its hash does. See
+   README.md for setup steps, and double-check the deployed rules in the
+   Firebase console — they can't be verified from this client code alone.
+
+   Photos are embedded as compressed base64 data: URLs directly in the
+   Firestore document (not Firebase Storage) — Cloud Storage now requires
+   the pay-as-you-go Blaze plan even at zero usage, and this keeps the
+   whole app on Firestore's free Spark tier. Compression retries at
+   progressively smaller sizes if needed to stay well under Firestore's
+   1MiB-per-document limit. */
 const FIREBASE_CONFIG = {
   apiKey: "YOUR_API_KEY",
   authDomain: "YOUR_PROJECT.firebaseapp.com",
@@ -137,12 +144,14 @@ let savedHash = null;
 try { savedHash = window.localStorage.getItem(CLOUD_KEY); } catch (e) {}
 let unlocked = !FIREBASE_ENABLED || !REQUIRE_PASSCODE || (REQUIRE_PASSCODE && !!savedHash);
 
-/* ── Firebase (Firestore + Storage) ───────────────────────────
+/* ── Firebase (Firestore only) ─────────────────────────────────
    One parent doc per passcode hash holds two subcollections — designs
    and wishlist — so each item is its own document (not one big blob),
    letting devices merge independent additions/edits without clobbering
-   each other. Photos live in Storage under the same hash prefix. */
-let db = null, storage = null, designsColRef = null, wishlistColRef = null;
+   each other. Photos are embedded as base64 data: URLs on the document
+   itself (see compressPhotoToDataURL below) rather than living in
+   Firebase Storage, which would require the paid Blaze plan. */
+let db = null, designsColRef = null, wishlistColRef = null;
 let unsubDesigns = null, unsubWishlist = null, firebaseLoading = null, passcodeHash = null;
 
 function ensureFirebase() {
@@ -159,7 +168,6 @@ function ensureFirebase() {
   }
   firebaseLoading = loadScript("https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js")
     .then(function () { return loadScript("https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"); })
-    .then(function () { return loadScript("https://www.gstatic.com/firebasejs/10.14.1/firebase-storage-compat.js"); })
     .then(function () { window.firebase.initializeApp(FIREBASE_CONFIG); });
   return firebaseLoading;
 }
@@ -181,7 +189,6 @@ function connectCloud(hash) {
   setSyncStatus("Connecting…");
   ensureFirebase().then(function () {
     db = window.firebase.firestore();
-    storage = window.firebase.storage();
     const parent = db.collection("passcodes").doc(hash);
     designsColRef = parent.collection("designs");
     wishlistColRef = parent.collection("wishlist");
@@ -246,15 +253,25 @@ function subscribeCloud() {
   });
 }
 
-/* Falls back to an embedded data: URL when Storage isn't configured or
-   reachable — local-only, but never blocks saving a design. */
-function uploadPhoto(blob, pathHint) {
-  if (!(FIREBASE_ENABLED && storage && passcodeHash)) return blobToDataURL(blob);
-  const path = "photos/" + passcodeHash + "/" + pathHint + "-" + Date.now() + ".jpg";
-  const ref = storage.ref().child(path);
-  return ref.put(blob, { contentType: "image/jpeg" }).then(function () { return ref.getDownloadURL(); }).catch(function () {
-    return blobToDataURL(blob);
-  });
+/* Compresses straight from the original file (not a re-encode of an
+   already-compressed preview, which would waste quality-per-byte) and
+   keeps shrinking until the base64 result comfortably fits inside
+   Firestore's 1MiB-per-document limit alongside the rest of the doc's
+   fields. Ordinary phone photos land in the first pass; this is a
+   safety net for the unusually detailed ones. */
+function compressPhotoToDataURL(file) {
+  const attempts = [[800, 0.6], [640, 0.5], [480, 0.4], [360, 0.35]];
+  const maxChars = 700000;
+  function tryAt(i) {
+    const step = attempts[i];
+    return downscaleImage(file, step[0], step[1]).then(function (blob) {
+      return blobToDataURL(blob).then(function (dataUrl) {
+        if (dataUrl.length <= maxChars || i === attempts.length - 1) return dataUrl;
+        return tryAt(i + 1);
+      });
+    });
+  }
+  return tryAt(0);
 }
 
 /* ── design / wishlist CRUD ────────────────────────────────── */
@@ -709,7 +726,7 @@ function bindDesignDetailEvents(id) {
 let formDraft = null;
 function makeDefaultDesignDraft() {
   return {
-    id: uid(), photoUrl: "", _photoBlob: null, _photoLocalPreview: null,
+    id: uid(), photoUrl: "", _photoFile: null, _photoLocalPreview: null,
     dateLogged: todayISO(), occasion: [], season: "", colors: [], technique: "",
     location: "", artistName: "", artistHandle: "", shape: "", rating: "",
     wouldRepeat: false, wishlistId: null, notes: ""
@@ -778,7 +795,7 @@ function bindDesignFormEvents(existingId) {
     const file = e.target.files[0];
     if (!file) return;
     downscaleImage(file, 800, 0.6).then(function (blob) {
-      formDraft._photoBlob = blob;
+      formDraft._photoFile = file;
       formDraft._photoLocalPreview = URL.createObjectURL(blob);
       refresh();
     }).catch(function () { showToast("Could not read that photo — try another.", { error: true }); });
@@ -827,7 +844,7 @@ function bindDesignFormEvents(existingId) {
   document.getElementById("form-save").addEventListener("click", function () {
     const saveBtn = document.getElementById("form-save");
     saveBtn.disabled = true; saveBtn.textContent = "Saving…";
-    Promise.resolve(formDraft._photoBlob ? uploadPhoto(formDraft._photoBlob, "design-" + formDraft.id) : formDraft.photoUrl)
+    Promise.resolve(formDraft._photoFile ? compressPhotoToDataURL(formDraft._photoFile) : formDraft.photoUrl)
       .then(function (photoUrl) {
         const design = {
           id: formDraft.id, photoUrl: photoUrl, dateLogged: formDraft.dateLogged || todayISO(),
@@ -1010,7 +1027,7 @@ function bindWishlistDetailEvents(id) {
 let wishDraft = null;
 function makeDefaultWishDraft() {
   return {
-    id: uid(), title: "", sourceUrl: "", thumbnailUrl: "", _thumbBlob: null, _thumbLocalPreview: null,
+    id: uid(), title: "", sourceUrl: "", thumbnailUrl: "", _thumbFile: null, _thumbLocalPreview: null,
     occasion: [], season: "", colors: [], notes: "", dateAdded: todayISO(), status: "saved", resultDesignId: null
   };
 }
@@ -1030,7 +1047,7 @@ function wishlistFormBodyHTML() {
         (previewSrc ? '<img id="thumb-preview" src="' + esc(previewSrc) + '" alt="">' : '<span class="photo-picker-hint" id="thumb-hint">Tap to upload an image</span>') +
         '<input type="file" accept="image/*" id="thumb-input"></label>' +
       '<div class="field-hint">Or paste an image URL:</div>' +
-      '<input class="form-input" id="field-thumb-url" placeholder="https://…" value="' + (wishDraft._thumbBlob ? "" : esc(wishDraft.thumbnailUrl)) + '" style="margin-top:6px;"></div>' +
+      '<input class="form-input" id="field-thumb-url" placeholder="https://…" value="' + (wishDraft._thumbFile ? "" : esc(wishDraft.thumbnailUrl)) + '" style="margin-top:6px;"></div>' +
     '<div class="form-section"><label class="form-label">Title</label><input class="form-input" id="field-title" placeholder="e.g. Almond French with gold foil" value="' + esc(wishDraft.title) + '"></div>' +
     '<div class="form-section"><label class="form-label">Source link</label><input class="form-input" id="field-source" type="url" placeholder="Pinterest or any link" value="' + esc(wishDraft.sourceUrl) + '"></div>' +
     '<div class="form-section"><label class="form-label">Occasion</label><div class="chip-row">' +
@@ -1055,14 +1072,14 @@ function bindWishlistFormEvents(existingId) {
     const file = e.target.files[0];
     if (!file) return;
     downscaleImage(file, 800, 0.6).then(function (blob) {
-      wishDraft._thumbBlob = blob;
+      wishDraft._thumbFile = file;
       wishDraft._thumbLocalPreview = URL.createObjectURL(blob);
       refresh();
     }).catch(function () { showToast("Could not read that image — try another.", { error: true }); });
   });
   document.getElementById("field-thumb-url").addEventListener("input", function (e) {
     wishDraft.thumbnailUrl = e.target.value;
-    wishDraft._thumbBlob = null;
+    wishDraft._thumbFile = null;
     wishDraft._thumbLocalPreview = null;
   });
   document.getElementById("field-title").addEventListener("input", function (e) { wishDraft.title = e.target.value; });
@@ -1109,7 +1126,7 @@ function bindWishlistFormEvents(existingId) {
     const isNew = !existingId;
     const saveBtn = document.getElementById("wish-form-save");
     saveBtn.disabled = true; saveBtn.textContent = "Saving…";
-    Promise.resolve(wishDraft._thumbBlob ? uploadPhoto(wishDraft._thumbBlob, "wishlist-" + wishDraft.id) : wishDraft.thumbnailUrl)
+    Promise.resolve(wishDraft._thumbFile ? compressPhotoToDataURL(wishDraft._thumbFile) : wishDraft.thumbnailUrl)
       .then(function (thumbnailUrl) {
         const item = {
           id: wishDraft.id, title: title, sourceUrl: wishDraft.sourceUrl || "", thumbnailUrl: thumbnailUrl || "",

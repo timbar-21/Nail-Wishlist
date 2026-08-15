@@ -129,11 +129,20 @@ function saveStoreLocal() {
 
 const state = Object.assign({
   filters: {
-    gallery: { query: "", occasion: null, season: null, color: null, rating: null, sort: "date" },
-    wishlist: { query: "", occasion: null, season: null, color: null, status: null }
+    gallery: { query: "", occasion: null, season: [], color: null, rating: null, sort: "date" },
+    wishlist: { query: "", occasion: null, season: [], color: null, status: null }
   },
   syncStatus: ""
 }, loadStore());
+
+/* Seasons are multi-select, and older saved records may still have a
+   single string from before that was true — accept either shape. */
+function seasonArray(item) {
+  const s = item && item.season;
+  if (Array.isArray(s)) return s;
+  if (s) return [s];
+  return [];
+}
 
 function allColors() {
   return DEFAULT_COLORS.concat(state.customColors.filter(function (c) { return DEFAULT_COLORS.indexOf(c) === -1; }));
@@ -459,11 +468,24 @@ function matchesFilters(item, f) {
     if (hay.indexOf(q) === -1) return false;
   }
   if (f.occasion && (item.occasion || []).indexOf(f.occasion) === -1) return false;
-  if (f.season && item.season !== f.season) return false;
+  if (f.season && f.season.length) {
+    const itemSeasons = seasonArray(item);
+    if (!f.season.some(function (s) { return itemSeasons.indexOf(s) >= 0; })) return false;
+  }
   if (f.color && (item.colors || []).indexOf(f.color) === -1) return false;
   if (f.rating && item.rating !== f.rating) return false;
   if (f.status && item.status !== f.status) return false;
   return true;
+}
+/* Every filter chip group is single-select except season, which toggles
+   membership in an array instead of swapping a lone scalar. */
+function toggleFilterValue(f, group, value) {
+  if (group === "season") {
+    const i = f.season.indexOf(value);
+    if (i >= 0) f.season.splice(i, 1); else f.season.push(value);
+  } else {
+    f[group] = f[group] === value ? null : value;
+  }
 }
 function sortDesigns(list, sort) {
   const arr = list.slice();
@@ -571,7 +593,7 @@ function galleryHTML() {
     '<div class="filter-group"><div class="filter-label">Occasion</div><div class="chip-row">' +
       OCCASIONS.map(function (o) { return chipHTML("occasion", o, o, f.occasion === o, "pink", "filter-gallery"); }).join("") + "</div></div>" +
     '<div class="filter-group"><div class="filter-label">Season</div><div class="chip-row">' +
-      SEASONS.map(function (s) { return chipHTML("season", s, s, f.season === s, "blue", "filter-gallery"); }).join("") + "</div></div>" +
+      SEASONS.map(function (s) { return chipHTML("season", s, s, f.season.indexOf(s) >= 0, "blue", "filter-gallery"); }).join("") + "</div></div>" +
     '<div class="filter-group"><div class="filter-label">Color</div><div class="chip-row">' +
       allColors().map(function (c) { return chipHTML("color", c, c, f.color === c, "sage", "filter-gallery"); }).join("") + "</div></div>" +
     '<div class="filter-group"><div class="filter-label">Rating</div><div class="chip-row">' +
@@ -616,8 +638,7 @@ function bindGalleryEvents() {
   root.querySelectorAll('[data-chip-mode="filter-gallery"]').forEach(function (btn) {
     btn.addEventListener("click", function () {
       const group = btn.dataset.chipGroup, value = btn.dataset.chipValue;
-      const f = state.filters.gallery;
-      f[group] = f[group] === value ? null : value;
+      toggleFilterValue(state.filters.gallery, group, value);
       renderRoute();
     });
   });
@@ -652,7 +673,7 @@ function designDetailHTML(id) {
       "</div>";
   const tags = [].concat(
     (d.occasion || []).map(function (o) { return '<span class="tag">' + esc(o) + "</span>"; }),
-    d.season ? ['<span class="tag">' + esc(d.season) + "</span>"] : [],
+    seasonArray(d).map(function (s) { return '<span class="tag">' + esc(s) + "</span>"; }),
     (d.colors || []).map(function (c) { return '<span class="tag">' + esc(c) + "</span>"; }),
     d.technique ? ['<span class="tag">' + esc(d.technique) + "</span>"] : [],
     d.shape ? ['<span class="tag">' + esc(d.shape) + "</span>"] : []
@@ -727,7 +748,7 @@ let formDraft = null;
 function makeDefaultDesignDraft() {
   return {
     id: uid(), photoUrl: "", _photoFile: null, _photoLocalPreview: null,
-    dateLogged: todayISO(), occasion: [], season: "", colors: [], technique: "",
+    dateLogged: todayISO(), occasion: [], season: [], colors: [], technique: "",
     location: "", artistName: "", artistHandle: "", shape: "", rating: "",
     wouldRepeat: false, wishlistId: null, notes: ""
   };
@@ -736,13 +757,14 @@ function initDesignDraft(existingId, fromWishlistId) {
   if (existingId) {
     const existing = state.designs.find(function (d) { return d.id === existingId; });
     formDraft = existing ? Object.assign(makeDefaultDesignDraft(), JSON.parse(JSON.stringify(existing))) : makeDefaultDesignDraft();
+    formDraft.season = seasonArray(formDraft);
   } else {
     formDraft = makeDefaultDesignDraft();
     if (fromWishlistId) {
       const w = state.wishlist.find(function (x) { return x.id === fromWishlistId; });
       if (w) {
         formDraft.occasion = (w.occasion || []).slice();
-        formDraft.season = w.season || "";
+        formDraft.season = seasonArray(w);
         formDraft.colors = (w.colors || []).slice();
         formDraft.wishlistId = w.id;
       }
@@ -769,7 +791,7 @@ function designFormBodyHTML() {
     '<div class="form-section"><label class="form-label">Occasion</label><div class="chip-row">' +
       OCCASIONS.map(function (o) { return chipHTML("occasion", o, o, formDraft.occasion.indexOf(o) >= 0, "pink", "design-multi"); }).join("") + "</div></div>" +
     '<div class="form-section"><label class="form-label">Season</label><div class="chip-row">' +
-      SEASONS.map(function (s) { return chipHTML("season", s, s, formDraft.season === s, "blue", "design-single"); }).join("") + "</div></div>" +
+      SEASONS.map(function (s) { return chipHTML("season", s, s, formDraft.season.indexOf(s) >= 0, "blue", "design-multi"); }).join("") + "</div></div>" +
     '<div class="form-section"><label class="form-label">Colors</label><div class="chip-row">' +
       allColors().map(function (c) { return chipHTML("colors", c, c, formDraft.colors.indexOf(c) >= 0, "sage", "design-multi"); }).join("") +
       '<button type="button" class="chip" id="add-color-btn">+ Other</button></div>' +
@@ -881,7 +903,7 @@ function wishlistHTML() {
     '<div class="filter-group"><div class="filter-label">Occasion</div><div class="chip-row">' +
       OCCASIONS.map(function (o) { return chipHTML("occasion", o, o, f.occasion === o, "pink", "filter-wishlist"); }).join("") + "</div></div>" +
     '<div class="filter-group"><div class="filter-label">Season</div><div class="chip-row">' +
-      SEASONS.map(function (s) { return chipHTML("season", s, s, f.season === s, "blue", "filter-wishlist"); }).join("") + "</div></div>" +
+      SEASONS.map(function (s) { return chipHTML("season", s, s, f.season.indexOf(s) >= 0, "blue", "filter-wishlist"); }).join("") + "</div></div>" +
     '<div class="filter-group"><div class="filter-label">Color</div><div class="chip-row">' +
       allColors().map(function (c) { return chipHTML("color", c, c, f.color === c, "sage", "filter-wishlist"); }).join("") + "</div></div>" +
     '<div class="filters-bar"><span class="result-line" id="wishlist-result-line"></span>' +
@@ -896,7 +918,7 @@ function wishCardHTML(w) {
     '<div class="wish-body"><span class="wish-status ' + (w.status === "tried" ? "wish-status-tried" : "wish-status-saved") + '">' +
       (w.status === "tried" ? "Tried" : "Saved") + "</span>" +
     '<div class="wish-title">' + esc(w.title || "Untitled") + "</div>" +
-    '<div class="wish-meta">' + esc(formatDate(w.dateAdded)) + (w.season ? " · " + esc(w.season) : "") + "</div></div></div>";
+    '<div class="wish-meta">' + esc(formatDate(w.dateAdded)) + (seasonArray(w).length ? " · " + esc(seasonArray(w).join(", ")) : "") + "</div></div></div>";
 }
 function updateWishlistResults() {
   const f = state.filters.wishlist;
@@ -923,8 +945,7 @@ function bindWishlistEvents() {
   root.querySelectorAll('[data-chip-mode="filter-wishlist"]').forEach(function (btn) {
     btn.addEventListener("click", function () {
       const group = btn.dataset.chipGroup, value = btn.dataset.chipValue;
-      const f = state.filters.wishlist;
-      f[group] = f[group] === value ? null : value;
+      toggleFilterValue(state.filters.wishlist, group, value);
       renderRoute();
     });
   });
@@ -946,7 +967,7 @@ function wishlistDetailHTML(id) {
   const result = w.resultDesignId ? state.designs.find(function (d) { return d.id === w.resultDesignId; }) : null;
   const tags = [].concat(
     (w.occasion || []).map(function (o) { return '<span class="tag">' + esc(o) + "</span>"; }),
-    w.season ? ['<span class="tag">' + esc(w.season) + "</span>"] : [],
+    seasonArray(w).map(function (s) { return '<span class="tag">' + esc(s) + "</span>"; }),
     (w.colors || []).map(function (c) { return '<span class="tag">' + esc(c) + "</span>"; })
   ).join("");
   const centerNav = list.length > 1 ? "" +
@@ -1028,13 +1049,14 @@ let wishDraft = null;
 function makeDefaultWishDraft() {
   return {
     id: uid(), title: "", sourceUrl: "", thumbnailUrl: "", _thumbFile: null, _thumbLocalPreview: null,
-    occasion: [], season: "", colors: [], notes: "", dateAdded: todayISO(), status: "saved", resultDesignId: null
+    occasion: [], season: [], colors: [], notes: "", dateAdded: todayISO(), status: "saved", resultDesignId: null
   };
 }
 function initWishlistDraft(existingId) {
   if (existingId) {
     const existing = state.wishlist.find(function (w) { return w.id === existingId; });
     wishDraft = existing ? Object.assign(makeDefaultWishDraft(), JSON.parse(JSON.stringify(existing))) : makeDefaultWishDraft();
+    wishDraft.season = seasonArray(wishDraft);
   } else {
     wishDraft = makeDefaultWishDraft();
   }
@@ -1053,7 +1075,7 @@ function wishlistFormBodyHTML() {
     '<div class="form-section"><label class="form-label">Occasion</label><div class="chip-row">' +
       OCCASIONS.map(function (o) { return chipHTML("occasion", o, o, wishDraft.occasion.indexOf(o) >= 0, "pink", "wish-multi"); }).join("") + "</div></div>" +
     '<div class="form-section"><label class="form-label">Season</label><div class="chip-row">' +
-      SEASONS.map(function (s) { return chipHTML("season", s, s, wishDraft.season === s, "blue", "wish-single"); }).join("") + "</div></div>" +
+      SEASONS.map(function (s) { return chipHTML("season", s, s, wishDraft.season.indexOf(s) >= 0, "blue", "wish-multi"); }).join("") + "</div></div>" +
     '<div class="form-section"><label class="form-label">Colors</label><div class="chip-row">' +
       allColors().map(function (c) { return chipHTML("colors", c, c, wishDraft.colors.indexOf(c) >= 0, "sage", "wish-multi"); }).join("") +
       '<button type="button" class="chip" id="wish-add-color-btn">+ Other</button></div>' +

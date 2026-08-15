@@ -303,3 +303,61 @@ img { max-width: 100%; display: block; }
 @media (min-width: 640px) {
   .grid { grid-template-columns: repeat(3, 1fr); }
 }
+
+/* ── swipeable detail cards ───────────────────────────────── */
+.swipe-card { touch-action: pan-y; will-change: transform; animation: cardEnter 200ms ease; }
+/* Native image drag-and-drop hijacks the pointer stream mid-gesture the
+   instant a drag starts over an <img> (exactly where a thumb lands to
+   swipe a photo card) — draggable="false" on the tags plus this belt-
+   and-suspenders rule keep our custom swipe in control instead. */
+.swipe-card img { -webkit-user-drag: none; user-drag: none; -webkit-user-select: none; user-select: none; }
+@keyframes cardEnter { from { opacity: 0; transform: scale(0.97); } to { opacity: 1; transform: none; } }
+.detail-topbar-center { display: flex; align-items: center; gap: 6px; }
+.icon-btn-sm { width: 32px; height: 32px; }
+.icon-btn-spacer { display: inline-block; width: 32px; height: 32px; }
+.swipe-position {
+  font-size: 11px; font-weight: 700; color: var(--color-neutral-600);
+  background: var(--color-surface); padding: 6px 12px; border-radius: var(--radius-pill);
+  box-shadow: var(--shadow-sm); white-space: nowrap;
+}
+
+/* ── image fade-in ────────────────────────────────────────── */
+.fade-img { opacity: 0; animation: fadeImgIn 320ms ease forwards; }
+@keyframes fadeImgIn { to { opacity: 1; } }
+
+/* ── toast ─────────────────────────────────────────────────── */
+.toast {
+  position: fixed; left: 50%; bottom: 96px; transform: translateX(-50%) translateY(8px);
+  background: var(--color-text); color: #fff; padding: 11px 18px; border-radius: var(--radius-pill);
+  font-size: 13.5px; font-weight: 600; box-shadow: var(--shadow-lg);
+  opacity: 0; transition: opacity 200ms ease, transform 200ms ease;
+  z-index: 100; max-width: 88%; text-align: center; pointer-events: none;
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+.toast-error { background: #C9536D; }
+
+/* ── bottom sheet (confirm dialogs) ──────────────────────────*/
+.sheet-overlay {
+  position: fixed; inset: 0; background: rgba(58, 50, 46, 0);
+  display: flex; align-items: flex-end; justify-content: center;
+  z-index: 200; transition: background 200ms ease;
+}
+.sheet-overlay.open { background: rgba(58, 50, 46, 0.42); }
+.sheet-card {
+  width: 100%; max-width: 480px; background: var(--color-surface);
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  padding: var(--space-6) var(--space-5) max(var(--space-6), env(safe-area-inset-bottom));
+  box-shadow: var(--shadow-lg); transform: translateY(100%);
+  transition: transform 240ms cubic-bezier(.32,.72,0,1);
+}
+.sheet-overlay.open .sheet-card { transform: translateY(0); }
+.sheet-message { font-size: 15px; margin-bottom: var(--space-4); text-align: center; }
+
+/* ── field validation feedback ────────────────────────────── */
+@keyframes shake {
+  10%, 90% { transform: translateX(-1px); }
+  20%, 80% { transform: translateX(2px); }
+  30%, 50%, 70% { transform: translateX(-4px); }
+  40%, 60% { transform: translateX(4px); }
+}
+.field-shake { animation: shake 400ms ease; }

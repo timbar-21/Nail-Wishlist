@@ -324,6 +324,112 @@ function backArrowSVG() { return '<svg viewBox="0 0 24 24" width="20" height="20
 function editSVG() { return '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"></path><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z"></path></svg>'; }
 function trashSVG() { return '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"></path><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path></svg>'; }
 function cameraGlyphSVG() { return '<svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="7" width="18" height="13" rx="2"></rect><path d="M8 7l1.5-2.5h5L16 7"></path><circle cx="12" cy="13.5" r="3.5"></circle></svg>'; }
+function chevronLeftSVG() { return '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"></path></svg>'; }
+function chevronRightSVG() { return '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"></path></svg>'; }
+
+/* ── swipe gesture ─────────────────────────────────────────── */
+/* Pointer Events cover touch + mouse with one code path. Axis is locked
+   on the first meaningful move so a mostly-vertical drag falls through
+   to native page scroll untouched (we never call preventDefault — CSS
+   touch-action:pan-y on the card does the work of telling the browser
+   vertical panning is still its job). Only horizontal drags animate the
+   card and can trigger a swipe. */
+function attachSwipe(el, handlers) {
+  let startX = 0, startY = 0, curX = 0, curY = 0, dragging = false, axis = null, pointerId = null;
+  const threshold = 70;
+  function onDown(e) {
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    pointerId = e.pointerId;
+    startX = curX = e.clientX; startY = curY = e.clientY;
+    dragging = true; axis = null;
+    /* Deliberately no setPointerCapture here: the swipe wrapper contains
+       ordinary buttons (edit/delete/back/chevrons), and capturing would
+       redirect their pointerup — and the click it synthesizes — to this
+       element instead of the button, silently breaking every tap. Plain
+       bubbling is enough since the wrapper spans the whole view. */
+  }
+  function onMove(e) {
+    if (!dragging || e.pointerId !== pointerId) return;
+    curX = e.clientX; curY = e.clientY;
+    const dx = curX - startX, dy = curY - startY;
+    if (!axis && (Math.abs(dx) > 8 || Math.abs(dy) > 8)) axis = Math.abs(dx) > Math.abs(dy) ? "x" : "y";
+    if (axis === "x" && handlers.onDragX) handlers.onDragX(dx);
+  }
+  function onUp(e) {
+    if (!dragging || e.pointerId !== pointerId) return;
+    dragging = false;
+    const dx = curX - startX;
+    if (axis === "x") {
+      if (dx <= -threshold && handlers.onSwipeLeft) handlers.onSwipeLeft();
+      else if (dx >= threshold && handlers.onSwipeRight) handlers.onSwipeRight();
+      else if (handlers.onCancelX) handlers.onCancelX();
+    }
+    axis = null;
+  }
+  el.addEventListener("pointerdown", onDown);
+  el.addEventListener("pointermove", onMove);
+  el.addEventListener("pointerup", onUp);
+  el.addEventListener("pointercancel", onUp);
+}
+function snapBack(el) {
+  el.style.transition = "transform 200ms ease";
+  el.style.transform = "";
+}
+function animateSwipeOut(el, dir, done) {
+  el.style.transition = "transform 160ms ease, opacity 160ms ease";
+  el.style.transform = "translateX(" + (dir === "left" ? "-36px" : "36px") + ")";
+  el.style.opacity = "0.15";
+  setTimeout(done, 150);
+}
+
+/* Keyboard left/right/escape while a detail view is mounted — replaced
+   wholesale on every navigation so stale handlers never stack up. */
+let activeKeyNavHandler = null;
+function clearDetailKeyNav() {
+  if (activeKeyNavHandler) { document.removeEventListener("keydown", activeKeyNavHandler); activeKeyNavHandler = null; }
+}
+function bindDetailKeyNav(kind, backHash, prevId, nextId) {
+  clearDetailKeyNav();
+  activeKeyNavHandler = function (e) {
+    if (e.key === "ArrowLeft" && prevId) navigate("#/" + kind + "/" + prevId);
+    else if (e.key === "ArrowRight" && nextId) navigate("#/" + kind + "/" + nextId);
+    else if (e.key === "Escape") navigate(backHash);
+  };
+  document.addEventListener("keydown", activeKeyNavHandler);
+}
+
+/* ── toast + confirm sheet (replace alert()/confirm()) ────────── */
+function showToast(message, opts) {
+  opts = opts || {};
+  const el = document.createElement("div");
+  el.className = "toast" + (opts.error ? " toast-error" : "");
+  el.textContent = message;
+  document.body.appendChild(el);
+  requestAnimationFrame(function () { el.classList.add("show"); });
+  setTimeout(function () {
+    el.classList.remove("show");
+    setTimeout(function () { el.remove(); }, 250);
+  }, opts.duration || 2200);
+}
+function showConfirmSheet(message, confirmLabel, onConfirm) {
+  const overlay = document.createElement("div");
+  overlay.className = "sheet-overlay";
+  overlay.innerHTML =
+    '<div class="sheet-card"><div class="sheet-message">' + esc(message) + "</div>" +
+    '<button type="button" class="btn btn-danger btn-block" id="sheet-confirm">' + esc(confirmLabel) + "</button>" +
+    '<button type="button" class="btn btn-outline btn-block" id="sheet-cancel" style="margin-top:8px;">Cancel</button></div>';
+  document.body.appendChild(overlay);
+  requestAnimationFrame(function () { overlay.classList.add("open"); });
+  function close() { overlay.classList.remove("open"); setTimeout(function () { overlay.remove(); }, 220); }
+  overlay.addEventListener("click", function (e) { if (e.target === overlay) close(); });
+  overlay.querySelector("#sheet-cancel").addEventListener("click", close);
+  overlay.querySelector("#sheet-confirm").addEventListener("click", function () { close(); onConfirm(); });
+}
+function shakeField(el) {
+  el.classList.remove("field-shake");
+  void el.offsetWidth;
+  el.classList.add("field-shake");
+}
 
 /* ── chips + filtering ─────────────────────────────────────── */
 function chipHTML(group, value, label, active, tone, mode) {
@@ -356,6 +462,17 @@ function sortDesigns(list, sort) {
   }
   return arr;
 }
+/* Same ordering the grid is currently showing, so swiping through a
+   detail view walks the list in the order it was opened from. */
+function getGalleryOrderedList() {
+  const f = state.filters.gallery;
+  return sortDesigns(state.designs.filter(function (d) { return matchesFilters(d, f); }), f.sort);
+}
+function getWishlistOrderedList() {
+  const f = state.filters.wishlist;
+  return state.wishlist.filter(function (w) { return matchesFilters(w, f); })
+    .slice().sort(function (a, b) { return (b.dateAdded || "").localeCompare(a.dateAdded || ""); });
+}
 
 /* ── router ────────────────────────────────────────────────── */
 function parseRoute() {
@@ -375,6 +492,7 @@ function updateNavActive(name, parts) {
 function renderRoute() {
   const r = parseRoute(), name = r.name, parts = r.parts;
   updateNavActive(name, parts);
+  clearDetailKeyNav();
   const root = document.getElementById("view-root");
   const title = document.getElementById("header-title");
   if (name === "wishlist" && parts[1] === "add") {
@@ -447,7 +565,7 @@ function galleryHTML() {
 }
 function designCardHTML(d) {
   const photo = d.photoUrl
-    ? '<img class="card-photo" src="' + esc(d.photoUrl) + '" loading="lazy" alt="">'
+    ? '<img class="card-photo fade-img" src="' + esc(d.photoUrl) + '" loading="lazy" alt="">'
     : '<div class="card-photo-empty">' + cameraGlyphSVG() + "</div>";
   const titleText = d.location || (d.occasion && d.occasion[0]) || "Untitled";
   return '<div class="card" data-open-design="' + d.id + '">' + photo +
@@ -500,16 +618,20 @@ function bindGalleryEvents() {
 function designDetailHTML(id) {
   const d = state.designs.find(function (x) { return x.id === id; });
   if (!d) return notFoundHTML();
+  const list = getGalleryOrderedList();
+  const idx = list.findIndex(function (x) { return x.id === id; });
+  const prevId = idx > 0 ? list[idx - 1].id : null;
+  const nextId = (idx >= 0 && idx < list.length - 1) ? list[idx + 1].id : null;
   const wish = d.wishlistId ? state.wishlist.find(function (w) { return w.id === d.wishlistId; }) : null;
   const photoBlock = wish ? "" +
     '<div class="compare-row">' +
       '<div class="compare-col"><div class="compare-label">Inspo</div><div class="compare-photo">' +
-        (wish.thumbnailUrl ? '<img src="' + esc(wish.thumbnailUrl) + '" alt="">' : "") + "</div></div>" +
+        (wish.thumbnailUrl ? '<img class="fade-img" src="' + esc(wish.thumbnailUrl) + '" alt="" draggable="false">' : "") + "</div></div>" +
       '<div class="compare-col"><div class="compare-label">Actual</div><div class="compare-photo">' +
-        (d.photoUrl ? '<img src="' + esc(d.photoUrl) + '" alt="">' : "") + "</div></div>" +
+        (d.photoUrl ? '<img class="fade-img" src="' + esc(d.photoUrl) + '" alt="" draggable="false">' : "") + "</div></div>" +
     "</div>"
     : '<div class="detail-photo-wrap">' +
-      (d.photoUrl ? '<img class="detail-photo" src="' + esc(d.photoUrl) + '" alt="">' : '<div class="detail-photo-empty">' + cameraGlyphSVG() + "</div>") +
+      (d.photoUrl ? '<img class="detail-photo fade-img" src="' + esc(d.photoUrl) + '" alt="" draggable="false">' : '<div class="detail-photo-empty">' + cameraGlyphSVG() + "</div>") +
       "</div>";
   const tags = [].concat(
     (d.occasion || []).map(function (o) { return '<span class="tag">' + esc(o) + "</span>"; }),
@@ -518,8 +640,15 @@ function designDetailHTML(id) {
     d.technique ? ['<span class="tag">' + esc(d.technique) + "</span>"] : [],
     d.shape ? ['<span class="tag">' + esc(d.shape) + "</span>"] : []
   ).join("");
-  return "" +
+  const centerNav = list.length > 1 ? "" +
+    '<div class="detail-topbar-center">' +
+      (prevId ? '<button class="icon-btn icon-btn-sm" id="detail-prev" aria-label="Previous design">' + chevronLeftSVG() + "</button>" : '<span class="icon-btn-spacer"></span>') +
+      '<span class="swipe-position">' + (idx + 1) + " / " + list.length + "</span>" +
+      (nextId ? '<button class="icon-btn icon-btn-sm" id="detail-next" aria-label="Next design">' + chevronRightSVG() + "</button>" : '<span class="icon-btn-spacer"></span>') +
+    "</div>" : "<div></div>";
+  return '<div class="swipe-card" id="swipe-card">' +
     '<div class="detail-topbar"><button class="icon-btn" id="detail-back" aria-label="Back">' + backArrowSVG() + "</button>" +
+      centerNav +
       '<div style="display:flex;gap:8px;"><button class="icon-btn" id="detail-edit" aria-label="Edit">' + editSVG() + "</button>" +
       '<button class="icon-btn" id="detail-delete" aria-label="Delete">' + trashSVG() + "</button></div></div>" +
     photoBlock +
@@ -531,16 +660,49 @@ function designDetailHTML(id) {
     ((d.artistName || d.artistHandle) ? '<div class="detail-field"><div class="detail-field-label">Nail Artist</div><div class="detail-field-value">' +
       esc(d.artistName || "") + (d.artistHandle ? " · " + esc(d.artistHandle) : "") + "</div></div>" : "") +
     '<div class="detail-field"><div class="detail-field-label">Logged</div><div class="detail-field-value">' + esc(formatDate(d.dateLogged)) + "</div></div>" +
-    (d.notes ? '<div class="detail-notes">' + esc(d.notes).replace(/\n/g, "<br>") + "</div>" : "");
+    (d.notes ? '<div class="detail-notes">' + esc(d.notes).replace(/\n/g, "<br>") + "</div>" : "") +
+    "</div>";
 }
 function bindDesignDetailEvents(id) {
   const d = state.designs.find(function (x) { return x.id === id; });
   if (!d) return;
+  const list = getGalleryOrderedList();
+  const idx = list.findIndex(function (x) { return x.id === id; });
+  const prevId = idx > 0 ? list[idx - 1].id : null;
+  const nextId = (idx >= 0 && idx < list.length - 1) ? list[idx + 1].id : null;
+
   document.getElementById("detail-back").addEventListener("click", function () { navigate("#/gallery"); });
   document.getElementById("detail-edit").addEventListener("click", function () { navigate("#/design/" + id + "/edit"); });
   document.getElementById("detail-delete").addEventListener("click", function () {
-    if (confirm("Delete this design? This can't be undone.")) { removeDesign(id); navigate("#/gallery"); }
+    showConfirmSheet("Delete this design? This can't be undone.", "Delete", function () {
+      removeDesign(id);
+      navigate("#/gallery");
+      showToast("Design deleted");
+    });
   });
+  const prevBtn = document.getElementById("detail-prev");
+  if (prevBtn) prevBtn.addEventListener("click", function () { navigate("#/design/" + prevId); });
+  const nextBtn = document.getElementById("detail-next");
+  if (nextBtn) nextBtn.addEventListener("click", function () { navigate("#/design/" + nextId); });
+
+  const card = document.getElementById("swipe-card");
+  attachSwipe(card, {
+    onDragX: function (dx) {
+      const resisted = ((dx < 0 && !nextId) || (dx > 0 && !prevId)) ? dx / 4 : dx;
+      card.style.transition = "none";
+      card.style.transform = "translateX(" + resisted + "px)";
+    },
+    onSwipeLeft: function () {
+      if (nextId) animateSwipeOut(card, "left", function () { navigate("#/design/" + nextId); });
+      else snapBack(card);
+    },
+    onSwipeRight: function () {
+      if (prevId) animateSwipeOut(card, "right", function () { navigate("#/design/" + prevId); });
+      else snapBack(card);
+    },
+    onCancelX: function () { snapBack(card); }
+  });
+  bindDetailKeyNav("design", "#/gallery", prevId, nextId);
 }
 
 /* ── add / edit design ─────────────────────────────────────── */
@@ -619,7 +781,7 @@ function bindDesignFormEvents(existingId) {
       formDraft._photoBlob = blob;
       formDraft._photoLocalPreview = URL.createObjectURL(blob);
       refresh();
-    }).catch(function () { alert("Could not read that photo — try another."); });
+    }).catch(function () { showToast("Could not read that photo — try another.", { error: true }); });
   });
   document.getElementById("field-date").addEventListener("input", function (e) { formDraft.dateLogged = e.target.value; });
   document.getElementById("field-repeat").addEventListener("change", function (e) { formDraft.wouldRepeat = e.target.checked; });
@@ -684,8 +846,9 @@ function bindDesignFormEvents(existingId) {
         if (formDraft._photoLocalPreview) URL.revokeObjectURL(formDraft._photoLocalPreview);
         formDraft = null;
         navigate("#/design/" + design.id);
+        showToast(isNew ? "Added to your gallery" : "Design updated");
       }).catch(function () {
-        alert("Could not save — check your connection and try again.");
+        showToast("Could not save — check your connection and try again.", { error: true });
         saveBtn.disabled = false; saveBtn.textContent = "Save";
       });
   });
@@ -710,7 +873,7 @@ function wishlistHTML() {
 }
 function wishCardHTML(w) {
   const thumb = w.thumbnailUrl
-    ? '<img class="wish-thumb" src="' + esc(w.thumbnailUrl) + '" alt="">'
+    ? '<img class="wish-thumb fade-img" src="' + esc(w.thumbnailUrl) + '" loading="lazy" alt="">'
     : '<div class="wish-thumb-empty">' + cameraGlyphSVG() + "</div>";
   return '<div class="wish-card" data-open-wish="' + w.id + '">' + thumb +
     '<div class="wish-body"><span class="wish-status ' + (w.status === "tried" ? "wish-status-tried" : "wish-status-saved") + '">' +
@@ -759,18 +922,29 @@ function bindWishlistEvents() {
 function wishlistDetailHTML(id) {
   const w = state.wishlist.find(function (x) { return x.id === id; });
   if (!w) return notFoundHTML();
+  const list = getWishlistOrderedList();
+  const idx = list.findIndex(function (x) { return x.id === id; });
+  const prevId = idx > 0 ? list[idx - 1].id : null;
+  const nextId = (idx >= 0 && idx < list.length - 1) ? list[idx + 1].id : null;
   const result = w.resultDesignId ? state.designs.find(function (d) { return d.id === w.resultDesignId; }) : null;
   const tags = [].concat(
     (w.occasion || []).map(function (o) { return '<span class="tag">' + esc(o) + "</span>"; }),
     w.season ? ['<span class="tag">' + esc(w.season) + "</span>"] : [],
     (w.colors || []).map(function (c) { return '<span class="tag">' + esc(c) + "</span>"; })
   ).join("");
-  return "" +
+  const centerNav = list.length > 1 ? "" +
+    '<div class="detail-topbar-center">' +
+      (prevId ? '<button class="icon-btn icon-btn-sm" id="detail-prev" aria-label="Previous item">' + chevronLeftSVG() + "</button>" : '<span class="icon-btn-spacer"></span>') +
+      '<span class="swipe-position">' + (idx + 1) + " / " + list.length + "</span>" +
+      (nextId ? '<button class="icon-btn icon-btn-sm" id="detail-next" aria-label="Next item">' + chevronRightSVG() + "</button>" : '<span class="icon-btn-spacer"></span>') +
+    "</div>" : "<div></div>";
+  return '<div class="swipe-card" id="swipe-card">' +
     '<div class="detail-topbar"><button class="icon-btn" id="detail-back" aria-label="Back">' + backArrowSVG() + "</button>" +
+      centerNav +
       '<div style="display:flex;gap:8px;"><button class="icon-btn" id="detail-edit" aria-label="Edit">' + editSVG() + "</button>" +
       '<button class="icon-btn" id="detail-delete" aria-label="Delete">' + trashSVG() + "</button></div></div>" +
     '<div class="detail-photo-wrap">' +
-      (w.thumbnailUrl ? '<img class="detail-photo" src="' + esc(w.thumbnailUrl) + '" alt="">' : '<div class="detail-photo-empty">' + cameraGlyphSVG() + "</div>") + "</div>" +
+      (w.thumbnailUrl ? '<img class="detail-photo fade-img" src="' + esc(w.thumbnailUrl) + '" alt="" draggable="false">' : '<div class="detail-photo-empty">' + cameraGlyphSVG() + "</div>") + "</div>" +
     '<h2 style="font-size:20px;margin-bottom:6px;">' + esc(w.title) + "</h2>" +
     (w.sourceUrl ? '<div class="link-preview"><a href="' + esc(w.sourceUrl) + '" target="_blank" rel="noopener">' + esc(w.sourceUrl) + "</a></div>" : "") +
     '<div class="detail-tags" style="margin-top:12px;"><span class="wish-status ' + (w.status === "tried" ? "wish-status-tried" : "wish-status-saved") + '">' +
@@ -781,15 +955,24 @@ function wishlistDetailHTML(id) {
       (w.status === "saved"
         ? '<button class="btn btn-primary" id="mark-tried-btn">Mark as tried</button>'
         : (result ? '<button class="btn btn-secondary" id="view-result-btn">View result</button>' : "")) +
-    "</div>";
+    "</div></div>";
 }
 function bindWishlistDetailEvents(id) {
   const w = state.wishlist.find(function (x) { return x.id === id; });
   if (!w) return;
+  const list = getWishlistOrderedList();
+  const idx = list.findIndex(function (x) { return x.id === id; });
+  const prevId = idx > 0 ? list[idx - 1].id : null;
+  const nextId = (idx >= 0 && idx < list.length - 1) ? list[idx + 1].id : null;
+
   document.getElementById("detail-back").addEventListener("click", function () { navigate("#/wishlist"); });
   document.getElementById("detail-edit").addEventListener("click", function () { navigate("#/wishlist/" + id + "/edit"); });
   document.getElementById("detail-delete").addEventListener("click", function () {
-    if (confirm("Delete this wishlist item?")) { removeWishlist(id); navigate("#/wishlist"); }
+    showConfirmSheet("Delete this wishlist item?", "Delete", function () {
+      removeWishlist(id);
+      navigate("#/wishlist");
+      showToast("Wishlist item deleted");
+    });
   });
   const markBtn = document.getElementById("mark-tried-btn");
   if (markBtn) markBtn.addEventListener("click", function () { navigate("#/design/new/from/" + id); });
@@ -798,6 +981,29 @@ function bindWishlistDetailEvents(id) {
     const cur = state.wishlist.find(function (x) { return x.id === id; });
     if (cur && cur.resultDesignId) navigate("#/design/" + cur.resultDesignId);
   });
+  const prevBtn = document.getElementById("detail-prev");
+  if (prevBtn) prevBtn.addEventListener("click", function () { navigate("#/wishlist/" + prevId); });
+  const nextBtn = document.getElementById("detail-next");
+  if (nextBtn) nextBtn.addEventListener("click", function () { navigate("#/wishlist/" + nextId); });
+
+  const card = document.getElementById("swipe-card");
+  attachSwipe(card, {
+    onDragX: function (dx) {
+      const resisted = ((dx < 0 && !nextId) || (dx > 0 && !prevId)) ? dx / 4 : dx;
+      card.style.transition = "none";
+      card.style.transform = "translateX(" + resisted + "px)";
+    },
+    onSwipeLeft: function () {
+      if (nextId) animateSwipeOut(card, "left", function () { navigate("#/wishlist/" + nextId); });
+      else snapBack(card);
+    },
+    onSwipeRight: function () {
+      if (prevId) animateSwipeOut(card, "right", function () { navigate("#/wishlist/" + prevId); });
+      else snapBack(card);
+    },
+    onCancelX: function () { snapBack(card); }
+  });
+  bindDetailKeyNav("wishlist", "#/wishlist", prevId, nextId);
 }
 
 /* ── add / edit wishlist item ──────────────────────────────── */
@@ -852,7 +1058,7 @@ function bindWishlistFormEvents(existingId) {
       wishDraft._thumbBlob = blob;
       wishDraft._thumbLocalPreview = URL.createObjectURL(blob);
       refresh();
-    }).catch(function () { alert("Could not read that image — try another."); });
+    }).catch(function () { showToast("Could not read that image — try another.", { error: true }); });
   });
   document.getElementById("field-thumb-url").addEventListener("input", function (e) {
     wishDraft.thumbnailUrl = e.target.value;
@@ -893,7 +1099,14 @@ function bindWishlistFormEvents(existingId) {
   });
   document.getElementById("wish-form-save").addEventListener("click", function () {
     const title = (wishDraft.title || "").trim();
-    if (!title) { alert("Give it a title first."); return; }
+    const titleField = document.getElementById("field-title");
+    if (!title) {
+      showToast("Give it a title first.", { error: true });
+      shakeField(titleField);
+      titleField.focus();
+      return;
+    }
+    const isNew = !existingId;
     const saveBtn = document.getElementById("wish-form-save");
     saveBtn.disabled = true; saveBtn.textContent = "Saving…";
     Promise.resolve(wishDraft._thumbBlob ? uploadPhoto(wishDraft._thumbBlob, "wishlist-" + wishDraft.id) : wishDraft.thumbnailUrl)
@@ -908,8 +1121,9 @@ function bindWishlistFormEvents(existingId) {
         if (wishDraft._thumbLocalPreview) URL.revokeObjectURL(wishDraft._thumbLocalPreview);
         wishDraft = null;
         navigate("#/wishlist/" + item.id);
+        showToast(isNew ? "Added to your wishlist" : "Wishlist item updated");
       }).catch(function () {
-        alert("Could not save — check your connection and try again.");
+        showToast("Could not save — check your connection and try again.", { error: true });
         saveBtn.disabled = false; saveBtn.textContent = "Save";
       });
   });

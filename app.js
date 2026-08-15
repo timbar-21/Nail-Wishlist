@@ -23,12 +23,12 @@ const CLOUD_KEY = "krista-nail-journal-cloud-hash";
    progressively smaller sizes if needed to stay well under Firestore's
    1MiB-per-document limit. */
 const FIREBASE_CONFIG = {
-  apiKey: "YOUR_API_KEY",
-  authDomain: "YOUR_PROJECT.firebaseapp.com",
-  projectId: "YOUR_PROJECT",
-  storageBucket: "YOUR_PROJECT.firebasestorage.app",
-  messagingSenderId: "YOUR_SENDER_ID",
-  appId: "YOUR_APP_ID"
+  apiKey: "AIzaSyCVtClz9XCob6rNXj80os2dNBNPRAczz-s",
+  authDomain: "nail-journal.firebaseapp.com",
+  projectId: "nail-journal",
+  storageBucket: "nail-journal.firebasestorage.app",
+  messagingSenderId: "496873883667",
+  appId: "1:496873883667:web:a529b5db06e2dda73fd7e6"
 };
 const FIREBASE_ENABLED = !!(FIREBASE_CONFIG.apiKey && FIREBASE_CONFIG.apiKey.indexOf("YOUR_") !== 0);
 

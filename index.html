@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Krista's Nail Journal</title>
+<meta name="description" content="A photo journal and wishlist for manicures and nail designs.">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="icon" href="icons/icon-192.png">
+<meta name="theme-color" content="#f6c9d6">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Nail Journal">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="lock-screen" class="lock-screen" hidden>
+  <div class="lock-card">
+    <div class="lock-glyph" aria-hidden="true"></div>
+    <h1 class="lock-title">Krista&rsquo;s<br>Nail Journal</h1>
+    <p class="lock-sub">Enter the passcode to sync this device.</p>
+    <input id="lock-input" class="lock-input" type="password" inputmode="text" autocomplete="off" placeholder="Passcode" autocapitalize="off" autocorrect="off" spellcheck="false">
+    <div id="lock-error" class="lock-error" hidden></div>
+    <button id="lock-submit" type="button" class="btn btn-primary btn-block">Unlock</button>
+  </div>
+</div>
+
+<div id="app" class="app" hidden>
+  <header class="app-header">
+    <h1 class="app-title" id="header-title">Gallery</h1>
+    <div style="display:flex;align-items:center;gap:10px;">
+      <span class="sync-status" id="sync-status"></span>
+      <button type="button" class="btn-text" id="lock-again-btn" hidden>Lock</button>
+    </div>
+  </header>
+
+  <main id="view-root" class="view-root"></main>
+
+  <nav class="bottom-nav" id="bottom-nav">
+    <button type="button" class="nav-btn" data-nav="gallery">
+      <span class="nav-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="22" height="22"><rect x="3" y="3" width="8" height="8" rx="2"></rect><rect x="13" y="3" width="8" height="8" rx="2"></rect><rect x="3" y="13" width="8" height="8" rx="2"></rect><rect x="13" y="13" width="8" height="8" rx="2"></rect></svg>
+      </span>
+      <span class="nav-label">Gallery</span>
+    </button>
+    <button type="button" class="nav-btn nav-btn-add" data-nav="add">
+      <span class="nav-icon nav-icon-add" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="26" height="26"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+      </span>
+      <span class="nav-label">Add</span>
+    </button>
+    <button type="button" class="nav-btn" data-nav="wishlist">
+      <span class="nav-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="22" height="22"><path d="M12 20.5s-7.5-4.6-9.8-9.1C.6 8 2 4.5 5.4 3.7c2-.5 4 .3 5.1 2 .5.8.6 1 1.5 1 .9 0 1-.2 1.5-1 1.1-1.7 3.1-2.5 5.1-2 3.4.8 4.8 4.3 3.2 7.7-2.3 4.5-9.8 9.1-9.8 9.1z"></path></svg>
+      </span>
+      <span class="nav-label">Wishlist</span>
+    </button>
+  </nav>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

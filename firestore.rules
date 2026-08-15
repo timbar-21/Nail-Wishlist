@@ -1,0 +1,36 @@
+rules_version = '2';
+
+// Access model: every design/wishlist document lives under
+// /passcodes/{hash}/..., where {hash} is the SHA-256 hex digest of the
+// shared passcode (computed client-side in app.js — the passcode itself
+// never reaches Firestore). Only a client that already knows the
+// passcode can compute a matching hash and read/write that path; the
+// regex below just keeps the path shape honest (a real 64-character hex
+// digest) and denies everything else, including any attempt to list
+// collections outside /passcodes or guess at malformed paths.
+//
+// This mirrors the trust model documented in app.js: it is NOT the same
+// as per-user auth. Anyone who learns the passcode (or brute-forces a
+// weak one) can read/write the whole journal. Pick a passcode that isn't
+// a dictionary word, and treat this file as something to double-check
+// in the Firebase console after deploying — rules can't be verified
+// from client code alone.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /passcodes/{hash} {
+      allow read, write: if hash.matches('^[0-9a-f]{64}$');
+
+      match /designs/{designId} {
+        allow read, write: if hash.matches('^[0-9a-f]{64}$');
+      }
+      match /wishlist/{itemId} {
+        allow read, write: if hash.matches('^[0-9a-f]{64}$');
+      }
+    }
+
+    // Default-deny everything else.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

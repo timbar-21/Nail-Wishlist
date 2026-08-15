@@ -45,7 +45,7 @@
 
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
-html, body { height: 100%; }
+html, body { height: 100%; overflow: hidden; }
 body {
   margin: 0;
   background: var(--color-bg);
@@ -77,10 +77,10 @@ img { max-width: 100%; display: block; }
 
 /* ── lock screen ───────────────────────────────────────────── */
 .lock-screen {
-  min-height: 100vh; min-height: 100dvh;
+  height: 100vh; height: 100dvh; overflow-y: auto;
   display: flex; align-items: center; justify-content: center;
   background: linear-gradient(180deg, var(--color-pink-100), var(--color-bg) 60%);
-  padding: var(--space-4);
+  padding: var(--space-4); box-sizing: border-box;
 }
 .lock-card {
   width: 100%; max-width: 380px; background: var(--color-surface);
@@ -108,11 +108,23 @@ img { max-width: 100%; display: block; }
 .lock-error { font-size: 12.5px; color: #C9536D; margin-bottom: var(--space-3); }
 
 /* ── app shell ─────────────────────────────────────────────── */
-.app { min-height: 100vh; min-height: 100dvh; padding-bottom: 84px; }
+/* The shell itself never scrolls — only #view-root does, as a normal
+   contained div. iOS Safari visually detaches position:fixed elements
+   from the viewport during momentum scrolling (worse, and more visible,
+   in a home-screen/standalone launch than a regular browser tab) — a
+   fixed bottom nav can appear to float mid-page for a moment while the
+   page is still moving. Making the header/nav ordinary flex siblings
+   that never move, with only the middle column scrolling, sidesteps
+   that class of bug entirely instead of patching around it. */
+.app {
+  height: 100vh; height: 100dvh;
+  display: flex; flex-direction: column;
+}
 .app-header {
+  flex: none;
   display: flex; align-items: baseline; justify-content: space-between;
   padding: max(var(--space-5), env(safe-area-inset-top)) var(--space-4) var(--space-3);
-  max-width: 560px; margin: 0 auto;
+  max-width: 560px; width: 100%; margin: 0 auto; box-sizing: border-box;
 }
 .app-brand {
   font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; font-weight: 700;
@@ -121,10 +133,13 @@ img { max-width: 100%; display: block; }
 .app-title { font-size: 26px; letter-spacing: -0.01em; }
 .sync-status { font-size: 11px; color: var(--color-neutral-500); font-weight: 600; }
 
-.view-root { max-width: 560px; margin: 0 auto; padding: 0 var(--space-4); }
+.view-root {
+  flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch;
+  max-width: 560px; margin: 0 auto; padding: 0 var(--space-4); width: 100%; box-sizing: border-box;
+}
 
 .bottom-nav {
-  position: fixed; left: 0; right: 0; bottom: 0;
+  flex: none;
   display: flex; justify-content: space-around; align-items: center;
   background: rgba(255,255,255,0.92); backdrop-filter: blur(10px);
   border-top: 1px solid var(--color-divider);

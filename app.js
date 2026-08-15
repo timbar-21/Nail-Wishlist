@@ -1220,7 +1220,8 @@ function wireStaticUI() {
   }
   window.addEventListener("hashchange", function () {
     renderRoute();
-    window.scrollTo(0, 0);
+    const root = document.getElementById("view-root");
+    if (root) root.scrollTop = 0;
   });
 }
 function boot() {

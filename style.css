@@ -316,6 +316,12 @@ img { max-width: 100%; display: block; }
 .link-preview { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--color-pink-700); word-break: break-all; margin-top: 4px; }
 .ai-status-line { font-size: 12px; font-style: italic; color: var(--color-neutral-500); margin-bottom: 8px; }
 
+/* ── suggestions ──────────────────────────────────────────── */
+.suggestion-card { background: var(--color-surface); border-radius: var(--radius-md); box-shadow: var(--shadow-sm); padding: var(--space-4); margin-bottom: var(--space-3); }
+.suggestion-title { font-size: 16px; font-weight: 700; margin-bottom: 4px; }
+.suggestion-desc { font-size: 13px; color: var(--color-neutral-600); line-height: 1.4; margin-bottom: 8px; }
+.search-entry-host { margin-top: var(--space-2); display: flex; justify-content: center; }
+
 /* animations */
 @keyframes riseIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
 .view-root > * { animation: riseIn 220ms ease; }

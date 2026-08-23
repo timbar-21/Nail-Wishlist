@@ -306,24 +306,39 @@ const PHOTO_ANALYSIS_SCHEMA = {
   required: ["title", "notes", "occasion", "season", "colors", "technique", "shape"]
 };
 
-let geminiModelPromise = null;
-function ensureGeminiModel() {
-  if (geminiModelPromise) return geminiModelPromise;
+/* Loaded once and shared by every Gemini feature (photo reading below,
+   trend suggestions further down) — a second `initializeApp` call with
+   the same name throws, so this is the one place that's allowed to call
+   it. Each feature then gets its own `getGenerativeModel` off the shared
+   `ai` instance, since different features need different generationConfig/
+   tools (constructing a model wrapper is local and free — no request). */
+let geminiAiPromise = null;
+function ensureGeminiAi() {
+  if (geminiAiPromise) return geminiAiPromise;
   const base = "https://www.gstatic.com/firebasejs/" + GEMINI_SDK_VERSION + "/";
-  geminiModelPromise = Promise.all([import(base + "firebase-app.js"), import(base + "firebase-ai.js")])
+  geminiAiPromise = Promise.all([import(base + "firebase-app.js"), import(base + "firebase-ai.js")])
     .then(function (mods) {
       const appMod = mods[0], aiMod = mods[1];
       const aiApp = appMod.initializeApp(FIREBASE_CONFIG, "ai-logic");
       const ai = aiMod.getAI(aiApp, { backend: new aiMod.GoogleAIBackend() });
-      return aiMod.getGenerativeModel(ai, {
-        model: GEMINI_MODEL_NAME,
-        generationConfig: { responseMimeType: "application/json", responseSchema: PHOTO_ANALYSIS_SCHEMA }
-      });
+      return { aiMod: aiMod, ai: ai };
     });
   /* Let a later attempt reload the SDK instead of replaying a stale
      rejection (e.g. the import itself failed because we were offline). */
-  geminiModelPromise.catch(function () { geminiModelPromise = null; });
-  return geminiModelPromise;
+  geminiAiPromise.catch(function () { geminiAiPromise = null; });
+  return geminiAiPromise;
+}
+let geminiPhotoModel = null;
+function ensureGeminiModel() {
+  return ensureGeminiAi().then(function (ctx) {
+    if (!geminiPhotoModel) {
+      geminiPhotoModel = ctx.aiMod.getGenerativeModel(ctx.ai, {
+        model: GEMINI_MODEL_NAME,
+        generationConfig: { responseMimeType: "application/json", responseSchema: PHOTO_ANALYSIS_SCHEMA }
+      });
+    }
+    return geminiPhotoModel;
+  });
 }
 function dataUrlToPart(dataUrl) {
   const m = /^data:([^;]+);base64,([\s\S]*)$/.exec(dataUrl || "");
@@ -419,6 +434,188 @@ function aiStatusLineHTML(item) {
   return '<div class="ai-status-line">' +
     (navigator.onLine ? "Reading photo for tag suggestions…" : "Offline — will read the photo once you’re back online.") +
     "</div>";
+}
+
+/* ── Gemini trend suggestions (Suggest tab) ─────────────────────
+   A separate, on-demand feature from photo reading above — there's no
+   already-saved photo to fall back on here, so a request just fails
+   while offline (the view explains that) rather than queuing. Grounds
+   each suggestion in a live Google Search via the googleSearch tool;
+   Gemini's structured-JSON mode isn't combinable with that tool, so the
+   prompt asks for a fenced JSON block instead and this parses it
+   leniently. Per Google's grounding terms, the search entry-point widget
+   Gemini returns alongside a grounded response is rendered together with
+   the suggestions it supports, via mountSearchEntryWidget below. */
+let geminiSuggestionsModel = null;
+function ensureSuggestionsModel() {
+  return ensureGeminiAi().then(function (ctx) {
+    if (!geminiSuggestionsModel) {
+      geminiSuggestionsModel = ctx.aiMod.getGenerativeModel(ctx.ai, {
+        model: GEMINI_MODEL_NAME,
+        tools: [{ googleSearch: {} }]
+      });
+    }
+    return geminiSuggestionsModel;
+  });
+}
+function buildSuggestionsPrompt(userPrompt) {
+  const order = { love: 0, like: 1, meh: 2, skip: 3, "": 4 };
+  const history = state.designs.slice()
+    .sort(function (a, b) { return (order[a.rating] === undefined ? 4 : order[a.rating]) - (order[b.rating] === undefined ? 4 : order[b.rating]); })
+    .slice(0, 15)
+    .map(function (d) {
+      const bits = [d.shape, d.technique].filter(Boolean).join(" ") || "manicure";
+      const colors = (d.colors || []).join("/") || "unspecified colors";
+      const occ = (d.occasion || []).join("/") || "no particular occasion";
+      return "- " + ratingLabel(d.rating) + ": " + bits + ", " + colors + ", for " + occ +
+        (d.notes ? " — \"" + d.notes.slice(0, 80) + "\"" : "");
+    }).join("\n");
+  const stillWants = state.wishlist.filter(function (w) { return w.status === "saved"; })
+    .slice(0, 10).map(function (w) { return "- " + w.title; }).join("\n");
+  const ask = userPrompt && userPrompt.trim()
+    ? "What they're in the mood for right now: " + userPrompt.trim()
+    : "They didn't say what they're in the mood for — surprise them, leaning on what they've rated highest.";
+  return "You are a nail-art trend assistant inside a personal nail journal app. " +
+    "Use Google Search to check what's trending in nail art right now, then suggest " +
+    "exactly 3 designs for this user to try next — a mix of what fits their taste and " +
+    "what's currently trending.\n\n" +
+    "Their manicure history, most-loved first:\n" + (history || "(no history yet)") + "\n\n" +
+    "Still on their wishlist (saved but not tried):\n" + (stillWants || "(none)") + "\n\n" +
+    ask + "\n\n" +
+    "Respond with ONLY a fenced ```json code block, nothing outside it, containing a JSON " +
+    "array of exactly 3 objects. Each object has: \"title\" (short, e.g. \"Almond French " +
+    "with gold foil\"), \"description\" (one enticing sentence — mention if it's trending " +
+    "right now), \"colors\" (array of 1-4 plain color names), \"occasion\" (array, only " +
+    "values from: " + OCCASIONS.join(", ") + " — or empty), \"season\" (array, only values " +
+    "from: " + SEASONS.join(", ") + " — or empty).";
+}
+function parseSuggestionsResponse(text) {
+  const fence = /```(?:json)?\s*([\s\S]*?)```/.exec(text || "");
+  const arr = JSON.parse((fence ? fence[1] : text || "").trim());
+  if (!Array.isArray(arr) || !arr.length) throw new Error("No suggestions in response");
+  return arr.slice(0, 3).map(function (s) {
+    return {
+      title: String((s && s.title) || "Untitled idea").slice(0, 120),
+      description: String((s && s.description) || "").slice(0, 300),
+      colors: Array.isArray(s && s.colors) ? s.colors.filter(Boolean).map(String).slice(0, 4) : [],
+      occasion: Array.isArray(s && s.occasion) ? s.occasion.filter(function (o) { return OCCASIONS.indexOf(o) >= 0; }) : [],
+      season: Array.isArray(s && s.season) ? s.season.filter(function (se) { return SEASONS.indexOf(se) >= 0; }) : []
+    };
+  });
+}
+function fetchNailSuggestions(userPrompt) {
+  return ensureSuggestionsModel().then(function (model) {
+    return model.generateContent(buildSuggestionsPrompt(userPrompt));
+  }).then(function (result) {
+    const suggestions = parseSuggestionsResponse(result.response.text());
+    const candidate = result.response.candidates && result.response.candidates[0];
+    const grounding = candidate && candidate.groundingMetadata;
+    const searchEntryHTML = (grounding && grounding.searchEntryPoint && grounding.searchEntryPoint.renderedContent) || "";
+    return { suggestions: suggestions, searchEntryHTML: searchEntryHTML };
+  });
+}
+function saveSuggestionToWishlist(sugg) {
+  sugg.colors.forEach(function (c) {
+    if (c && allColors().indexOf(c) === -1 && state.customColors.indexOf(c) === -1) state.customColors.push(c);
+  });
+  saveStoreLocal();
+  const item = {
+    id: uid(), title: sugg.title, sourceUrl: "", thumbnailUrl: "",
+    occasion: sugg.occasion.slice(), season: sugg.season.slice(), colors: sugg.colors.slice(),
+    notes: sugg.description, dateAdded: todayISO(), status: "saved", resultDesignId: null,
+    aiAnalyzedAt: Date.now(), updatedAt: Date.now()
+  };
+  upsertWishlist(item);
+}
+
+let suggestState = { query: "", loading: false, error: "", results: null, searchEntryHTML: "" };
+function suggestionCardHTML(sugg, idx) {
+  const tags = [].concat(
+    sugg.occasion.map(function (o) { return '<span class="tag">' + esc(o) + "</span>"; }),
+    sugg.season.map(function (s) { return '<span class="tag">' + esc(s) + "</span>"; }),
+    sugg.colors.map(function (c) { return '<span class="tag">' + esc(c) + "</span>"; })
+  ).join("");
+  return '<div class="suggestion-card">' +
+    '<div class="suggestion-title">' + esc(sugg.title) + "</div>" +
+    '<div class="suggestion-desc">' + esc(sugg.description) + "</div>" +
+    '<div class="detail-tags">' + tags + "</div>" +
+    '<button type="button" class="btn btn-secondary btn-block" data-save-suggestion="' + idx + '" style="margin-top:10px;">Save to Wishlist</button>' +
+    "</div>";
+}
+function suggestionsResultsHTML() {
+  if (suggestState.loading) {
+    return '<div class="empty-state"><div class="empty-title">Reading trends…</div>' +
+      '<div class="empty-body">Checking your history and what’s trending right now.</div></div>';
+  }
+  if (suggestState.error) {
+    return '<div class="empty-state"><div class="empty-title">Couldn’t get suggestions</div>' +
+      '<div class="empty-body">' + esc(suggestState.error) + "</div></div>";
+  }
+  if (!suggestState.results) {
+    return '<div class="empty-state"><div class="empty-title">What are you in the mood for?</div>' +
+      '<div class="empty-body">Describe a vibe, or tap Surprise me — suggestions are based on your saved designs and what’s trending now.</div></div>';
+  }
+  return suggestState.results.map(suggestionCardHTML).join("") +
+    (suggestState.searchEntryHTML ? '<div id="search-entry-host" class="search-entry-host"></div>' : "");
+}
+function suggestionsHTML() {
+  if (!GEMINI_ENABLED) {
+    return '<div class="empty-state"><div class="empty-title">Not set up yet</div>' +
+      '<div class="empty-body">Suggestions need Firebase AI Logic configured — see the README.</div></div>';
+  }
+  const offline = !navigator.onLine;
+  return "" +
+    '<div class="form-section"><textarea class="form-textarea" id="suggest-input" placeholder="e.g. something for a summer wedding" rows="2">' + esc(suggestState.query) + "</textarea></div>" +
+    '<div class="form-actions" style="margin-bottom:16px;">' +
+      '<button type="button" class="btn btn-outline" id="suggest-surprise"' + (offline ? " disabled" : "") + '>Surprise me</button>' +
+      '<button type="button" class="btn btn-primary" id="suggest-go"' + (offline ? " disabled" : "") + '>Get suggestions</button>' +
+    "</div>" +
+    (offline ? '<div class="ai-status-line">You’re offline — suggestions need a live connection.</div>' : "") +
+    '<div id="suggest-results">' + suggestionsResultsHTML() + "</div>";
+}
+function mountSearchEntryWidget() {
+  const host = document.getElementById("search-entry-host");
+  if (host && suggestState.searchEntryHTML && !host.shadowRoot) {
+    host.attachShadow({ mode: "open" }).innerHTML = suggestState.searchEntryHTML;
+  }
+}
+function bindSuggestSaveButtons() {
+  const container = document.getElementById("suggest-results");
+  if (!container) return;
+  container.querySelectorAll("[data-save-suggestion]").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      const sugg = suggestState.results && suggestState.results[Number(btn.dataset.saveSuggestion)];
+      if (!sugg) return;
+      saveSuggestionToWishlist(sugg);
+      btn.textContent = "Saved ✓"; btn.disabled = true;
+      showToast("Saved to your wishlist");
+    });
+  });
+}
+function bindSuggestionsEvents() {
+  if (!GEMINI_ENABLED) return;
+  mountSearchEntryWidget();
+  bindSuggestSaveButtons();
+  document.getElementById("suggest-input").addEventListener("input", function (e) { suggestState.query = e.target.value; });
+  function runSuggestions(prompt) {
+    if (!navigator.onLine) { showToast("You’re offline — try again once you’re back online.", { error: true }); return; }
+    suggestState.loading = true; suggestState.error = ""; suggestState.results = null; suggestState.searchEntryHTML = "";
+    document.getElementById("suggest-results").innerHTML = suggestionsResultsHTML();
+    fetchNailSuggestions(prompt).then(function (res) {
+      suggestState.loading = false;
+      suggestState.results = res.suggestions;
+      suggestState.searchEntryHTML = res.searchEntryHTML;
+      document.getElementById("suggest-results").innerHTML = suggestionsResultsHTML();
+      mountSearchEntryWidget();
+      bindSuggestSaveButtons();
+    }).catch(function () {
+      suggestState.loading = false;
+      suggestState.error = navigator.onLine ? "Something went wrong — try again in a moment." : "You’re offline — try again once you’re back online.";
+      document.getElementById("suggest-results").innerHTML = suggestionsResultsHTML();
+    });
+  }
+  document.getElementById("suggest-go").addEventListener("click", function () { runSuggestions(suggestState.query); });
+  document.getElementById("suggest-surprise").addEventListener("click", function () { runSuggestions(""); });
 }
 
 /* Compresses straight from the original file (not a re-encode of an
@@ -682,7 +879,7 @@ function navigate(hash) {
   else location.hash = hash;
 }
 function updateNavActive(name, parts) {
-  const tab = name === "wishlist" ? "wishlist" : (name === "design" && parts[1] === "new") ? "add" : "gallery";
+  const tab = name === "wishlist" ? "wishlist" : name === "suggest" ? "suggest" : (name === "design" && parts[1] === "new") ? "add" : "gallery";
   document.querySelectorAll(".nav-btn").forEach(function (btn) {
     btn.classList.toggle("active", btn.dataset.nav === tab);
   });
@@ -693,7 +890,11 @@ function renderRoute() {
   clearDetailKeyNav();
   const root = document.getElementById("view-root");
   const title = document.getElementById("header-title");
-  if (name === "wishlist" && parts[1] === "add") {
+  if (name === "suggest") {
+    title.textContent = "Suggestions";
+    root.innerHTML = suggestionsHTML();
+    bindSuggestionsEvents();
+  } else if (name === "wishlist" && parts[1] === "add") {
     title.textContent = "Add to Wishlist";
     initWishlistDraft(null);
     root.innerHTML = wishlistFormBodyHTML();
@@ -1393,7 +1594,10 @@ function wireStaticUI() {
     if (root) root.scrollTop = 0;
   });
   window.addEventListener("online", scheduleGeminiQueue);
+  window.addEventListener("online", refreshSuggestViewIfOpen);
+  window.addEventListener("offline", refreshSuggestViewIfOpen);
 }
+function refreshSuggestViewIfOpen() { if (parseRoute().name === "suggest") renderRoute(); }
 function boot() {
   wireStaticUI();
   if (unlocked) {

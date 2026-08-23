@@ -98,6 +98,28 @@ local-first storage and cross-device sync the rest of the app already
 uses. The design/wishlist detail view shows a small "Offline — will read
 the photo once you're back online" note while a photo is waiting.
 
+## Trend suggestions (optional)
+
+The **Suggest** tab asks Gemini for 3 nail design ideas, grounded in a live
+Google Search so they reflect what's actually trending right now, not just
+the model's training data — and personalized using your manicure history
+(most-loved designs weighted first) and whatever's still saved-but-not-tried
+on your wishlist. Type what you're in the mood for, or tap "Surprise me."
+Each suggestion has a one-tap "Save to Wishlist" button.
+
+This shares the same Firebase AI Logic setup as photo reading above — no
+extra setup beyond turning on AI Logic once (see above). Two differences
+from photo reading, though:
+
+- **No offline caching here.** Photo reading has an already-saved photo to
+  fall back on and retry later; a suggestion request has no such anchor,
+  so it just needs a live connection when you tap the button (the tab
+  says so, and disables its buttons, while you're offline).
+- **Search grounding.** Because Gemini actually searches the web for this
+  feature, Google's grounding terms require showing the "Search
+  Suggestions" widget it returns alongside a grounded response — the app
+  renders that automatically beneath the suggestion cards.
+
 ## Data model
 
 - `designs` — one Firestore document per logged manicure: photo (embedded

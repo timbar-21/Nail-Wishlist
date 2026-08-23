@@ -314,6 +314,7 @@ img { max-width: 100%; display: block; }
 .wish-status-tried { background: var(--color-sage); color: #3E5A2D; }
 
 .link-preview { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--color-pink-700); word-break: break-all; margin-top: 4px; }
+.ai-status-line { font-size: 12px; font-style: italic; color: var(--color-neutral-500); margin-bottom: 8px; }
 
 /* animations */
 @keyframes riseIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }

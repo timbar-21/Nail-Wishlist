@@ -32,6 +32,19 @@ const FIREBASE_CONFIG = {
 };
 const FIREBASE_ENABLED = !!(FIREBASE_CONFIG.apiKey && FIREBASE_CONFIG.apiKey.indexOf("YOUR_") !== 0);
 
+/* Gemini reads each photo (instead of OCR/manual tagging) via Firebase AI
+   Logic, which reuses FIREBASE_CONFIG above rather than a separate API key
+   — the Gemini Developer API backend it talks to stays on the free Spark
+   plan, same as Firestore. Needs "AI Logic" turned on once for this
+   project in the Firebase console (see README); until then calls just
+   fail quietly and no tags get auto-filled. Loaded as real ES modules from
+   the gstatic CDN via dynamic import (this app has no build step), kept
+   as a separate named app instance from the firebase-*-compat.js bundle
+   above so the two never contend over the default app. */
+const GEMINI_SDK_VERSION = "12.18.0";
+const GEMINI_MODEL_NAME = "gemini-2.5-flash";
+const GEMINI_ENABLED = FIREBASE_ENABLED;
+
 /* On by default (unlike the wine app, which left this off) — every
    device needs the shared passcode before it can read or write designs. */
 const REQUIRE_PASSCODE = true;
@@ -220,6 +233,7 @@ function connectCloud(hash) {
   }).then(function () {
     subscribeCloud();
     setSyncStatus("Synced");
+    scheduleGeminiQueue();
   }).catch(function () {
     setSyncStatus("Offline — saved on this device, will sync when reconnected.");
   });
@@ -260,6 +274,151 @@ function subscribeCloud() {
   }, function () {
     setSyncStatus("Offline — saved on this device, will sync when reconnected.");
   });
+}
+
+/* ── Gemini photo reading (Firebase AI Logic) ──────────────────
+   Runs after a design/wishlist photo is saved, not before — saving never
+   waits on it. Which photos still need reading is derived from the data
+   itself (has a photo, has no aiAnalyzedAt) rather than a separate queue,
+   so "cache until service is restored" falls straight out of the app's
+   existing local-first storage: an offline save just leaves aiAnalyzedAt
+   unset, and the next online moment (an 'online' event or the next app
+   boot) picks it back up automatically. */
+const PHOTO_ANALYSIS_PROMPT = "You are looking at a photo of someone's " +
+  "fingernails/manicure, or a nail-art inspiration photo saved to a nail " +
+  "journal app. Describe it so it can be filed away: a short descriptive " +
+  "title (e.g. \"Almond French with gold foil\"), a one-sentence note " +
+  "describing the look, any occasion/season tags that plausibly fit, the " +
+  "nail colors visible (plain color names), and the technique and nail " +
+  "shape if you can tell (leave technique or shape as an empty string " +
+  "if you can't). Base every field only on what's actually visible.";
+const PHOTO_ANALYSIS_SCHEMA = {
+  type: "object",
+  properties: {
+    title: { type: "string" },
+    notes: { type: "string" },
+    occasion: { type: "array", items: { type: "string", enum: OCCASIONS } },
+    season: { type: "array", items: { type: "string", enum: SEASONS } },
+    colors: { type: "array", items: { type: "string" } },
+    technique: { type: "string", enum: TECHNIQUES.concat([""]) },
+    shape: { type: "string", enum: SHAPES.concat([""]) }
+  },
+  required: ["title", "notes", "occasion", "season", "colors", "technique", "shape"]
+};
+
+let geminiModelPromise = null;
+function ensureGeminiModel() {
+  if (geminiModelPromise) return geminiModelPromise;
+  const base = "https://www.gstatic.com/firebasejs/" + GEMINI_SDK_VERSION + "/";
+  geminiModelPromise = Promise.all([import(base + "firebase-app.js"), import(base + "firebase-ai.js")])
+    .then(function (mods) {
+      const appMod = mods[0], aiMod = mods[1];
+      const aiApp = appMod.initializeApp(FIREBASE_CONFIG, "ai-logic");
+      const ai = aiMod.getAI(aiApp, { backend: new aiMod.GoogleAIBackend() });
+      return aiMod.getGenerativeModel(ai, {
+        model: GEMINI_MODEL_NAME,
+        generationConfig: { responseMimeType: "application/json", responseSchema: PHOTO_ANALYSIS_SCHEMA }
+      });
+    });
+  /* Let a later attempt reload the SDK instead of replaying a stale
+     rejection (e.g. the import itself failed because we were offline). */
+  geminiModelPromise.catch(function () { geminiModelPromise = null; });
+  return geminiModelPromise;
+}
+function dataUrlToPart(dataUrl) {
+  const m = /^data:([^;]+);base64,([\s\S]*)$/.exec(dataUrl || "");
+  return m ? { inlineData: { mimeType: m[1], data: m[2] } } : null;
+}
+function analyzePhotoDataUrl(dataUrl) {
+  const part = dataUrlToPart(dataUrl);
+  if (!part) return Promise.reject(new Error("No photo to analyze"));
+  return ensureGeminiModel()
+    .then(function (model) { return model.generateContent([{ text: PHOTO_ANALYSIS_PROMPT }, part]); })
+    .then(function (result) { return JSON.parse(result.response.text()); });
+}
+/* Only fills fields the user hasn't already touched, so a suggestion that
+   lands minutes (or devices) after saving can never clobber an edit. */
+function applyAiSuggestions(item, suggestions, kind) {
+  let changed = false;
+  if ((!item.occasion || !item.occasion.length) && suggestions.occasion && suggestions.occasion.length) {
+    item.occasion = suggestions.occasion.slice(); changed = true;
+  }
+  if (!seasonArray(item).length && suggestions.season && suggestions.season.length) {
+    item.season = suggestions.season.slice(); changed = true;
+  }
+  if ((!item.colors || !item.colors.length) && suggestions.colors && suggestions.colors.length) {
+    item.colors = suggestions.colors.slice(0, 4);
+    suggestions.colors.forEach(function (c) {
+      if (c && allColors().indexOf(c) === -1 && state.customColors.indexOf(c) === -1) state.customColors.push(c);
+    });
+    saveStoreLocal();
+    changed = true;
+  }
+  if (!item.notes && suggestions.notes) { item.notes = suggestions.notes; changed = true; }
+  if (kind === "design") {
+    if (!item.technique && suggestions.technique) { item.technique = suggestions.technique; changed = true; }
+    if (!item.shape && suggestions.shape) { item.shape = suggestions.shape; changed = true; }
+  } else if (kind === "wishlist") {
+    if ((!item.title || item.title === "Untitled") && suggestions.title) { item.title = suggestions.title; changed = true; }
+  }
+  return changed;
+}
+function pendingAiJobs() {
+  return state.designs.filter(function (d) { return d.photoUrl && !d.aiAnalyzedAt; })
+    .map(function (d) { return { id: d.id, kind: "design" }; })
+    .concat(state.wishlist.filter(function (w) { return w.thumbnailUrl && !w.aiAnalyzedAt; })
+      .map(function (w) { return { id: w.id, kind: "wishlist" }; }));
+}
+function refreshOpenDetailIfMatches(kind, id) {
+  const r = parseRoute();
+  if (r.name === kind && r.parts[1] === id && !r.parts[2]) renderRoute();
+}
+let geminiQueueRunning = false;
+const geminiAttemptCounts = {};
+/* Walks the pending list one photo at a time (gentler on quota than a
+   burst) whenever we might be online. Safe to call often — it's a no-op
+   while offline, already running, or nothing needs reading. */
+function processGeminiQueue() {
+  if (!GEMINI_ENABLED || geminiQueueRunning || !navigator.onLine) return;
+  const jobs = pendingAiJobs();
+  if (!jobs.length) return;
+  geminiQueueRunning = true;
+  (function next(i) {
+    if (i >= jobs.length) { geminiQueueRunning = false; return; }
+    const job = jobs[i];
+    const key = job.kind + ":" + job.id;
+    const list = job.kind === "design" ? state.designs : state.wishlist;
+    const item = list.find(function (x) { return x.id === job.id; });
+    const photo = item && (job.kind === "design" ? item.photoUrl : item.thumbnailUrl);
+    if (!item || !photo || item.aiAnalyzedAt) return next(i + 1);
+    analyzePhotoDataUrl(photo).then(function (suggestions) {
+      const fresh = list.find(function (x) { return x.id === job.id; });
+      if (fresh) {
+        applyAiSuggestions(fresh, suggestions, job.kind);
+        fresh.aiAnalyzedAt = Date.now();
+        if (job.kind === "design") upsertDesign(fresh); else upsertWishlist(fresh);
+        refreshOpenDetailIfMatches(job.kind, job.id);
+      }
+      delete geminiAttemptCounts[key];
+    }).catch(function () {
+      geminiAttemptCounts[key] = (geminiAttemptCounts[key] || 0) + 1;
+      /* After repeated non-offline failures (bad response, quota, etc.)
+         stop retrying this item so a broken photo can't loop forever —
+         -1 is a truthy "gave up" marker, distinct from a real timestamp. */
+      if (geminiAttemptCounts[key] >= 3) {
+        const fresh = list.find(function (x) { return x.id === job.id; });
+        if (fresh) { fresh.aiAnalyzedAt = -1; if (job.kind === "design") upsertDesign(fresh); else upsertWishlist(fresh); }
+      }
+    }).then(function () { next(i + 1); });
+  })(0);
+}
+function scheduleGeminiQueue() { setTimeout(processGeminiQueue, 0); }
+function aiStatusLineHTML(item) {
+  const hasPhoto = !!(item.photoUrl || item.thumbnailUrl);
+  if (!GEMINI_ENABLED || !hasPhoto || item.aiAnalyzedAt) return "";
+  return '<div class="ai-status-line">' +
+    (navigator.onLine ? "Reading photo for tag suggestions…" : "Offline — will read the photo once you’re back online.") +
+    "</div>";
 }
 
 /* Compresses straight from the original file (not a re-encode of an
@@ -689,6 +848,7 @@ function designDetailHTML(id) {
       centerNav +
       '<div style="display:flex;gap:8px;"><button class="icon-btn" id="detail-edit" aria-label="Edit">' + editSVG() + "</button>" +
       '<button class="icon-btn" id="detail-delete" aria-label="Delete">' + trashSVG() + "</button></div></div>" +
+    aiStatusLineHTML(d) +
     photoBlock +
     '<div class="detail-rating-row">' + ratingIconSVG(d.rating, 30, "detail-rating-icon") +
       '<span class="detail-rating-label">' + esc(ratingLabel(d.rating)) + "</span>" +
@@ -747,10 +907,10 @@ function bindDesignDetailEvents(id) {
 let formDraft = null;
 function makeDefaultDesignDraft() {
   return {
-    id: uid(), photoUrl: "", _photoFile: null, _photoLocalPreview: null,
+    id: uid(), photoUrl: "", _photoFile: null, _photoLocalPreview: null, _originalPhotoUrl: "",
     dateLogged: todayISO(), occasion: [], season: [], colors: [], technique: "",
     location: "", artistName: "", artistHandle: "", shape: "", rating: "",
-    wouldRepeat: false, wishlistId: null, notes: ""
+    wouldRepeat: false, wishlistId: null, notes: "", aiAnalyzedAt: null
   };
 }
 function initDesignDraft(existingId, fromWishlistId) {
@@ -758,6 +918,7 @@ function initDesignDraft(existingId, fromWishlistId) {
     const existing = state.designs.find(function (d) { return d.id === existingId; });
     formDraft = existing ? Object.assign(makeDefaultDesignDraft(), JSON.parse(JSON.stringify(existing))) : makeDefaultDesignDraft();
     formDraft.season = seasonArray(formDraft);
+    formDraft._originalPhotoUrl = formDraft.photoUrl;
   } else {
     formDraft = makeDefaultDesignDraft();
     if (fromWishlistId) {
@@ -874,6 +1035,7 @@ function bindDesignFormEvents(existingId) {
           technique: formDraft.technique, location: formDraft.location, artistName: formDraft.artistName,
           artistHandle: formDraft.artistHandle, shape: formDraft.shape, rating: formDraft.rating,
           wouldRepeat: !!formDraft.wouldRepeat, wishlistId: formDraft.wishlistId || null, notes: formDraft.notes,
+          aiAnalyzedAt: photoUrl && photoUrl !== formDraft._originalPhotoUrl ? null : (formDraft.aiAnalyzedAt || null),
           updatedAt: Date.now()
         };
         const isNew = !existingId;
@@ -886,6 +1048,7 @@ function bindDesignFormEvents(existingId) {
         formDraft = null;
         navigate("#/design/" + design.id);
         showToast(isNew ? "Added to your gallery" : "Design updated");
+        scheduleGeminiQueue();
       }).catch(function () {
         showToast("Could not save — check your connection and try again.", { error: true });
         saveBtn.disabled = false; saveBtn.textContent = "Save";
@@ -981,6 +1144,7 @@ function wishlistDetailHTML(id) {
       centerNav +
       '<div style="display:flex;gap:8px;"><button class="icon-btn" id="detail-edit" aria-label="Edit">' + editSVG() + "</button>" +
       '<button class="icon-btn" id="detail-delete" aria-label="Delete">' + trashSVG() + "</button></div></div>" +
+    aiStatusLineHTML(w) +
     '<div class="detail-photo-wrap">' +
       (w.thumbnailUrl ? '<img class="detail-photo fade-img" src="' + esc(w.thumbnailUrl) + '" alt="" draggable="false">' : '<div class="detail-photo-empty">' + cameraGlyphSVG() + "</div>") + "</div>" +
     '<h2 style="font-size:20px;margin-bottom:6px;">' + esc(w.title) + "</h2>" +
@@ -1048,8 +1212,8 @@ function bindWishlistDetailEvents(id) {
 let wishDraft = null;
 function makeDefaultWishDraft() {
   return {
-    id: uid(), title: "", sourceUrl: "", thumbnailUrl: "", _thumbFile: null, _thumbLocalPreview: null,
-    occasion: [], season: [], colors: [], notes: "", dateAdded: todayISO(), status: "saved", resultDesignId: null
+    id: uid(), title: "", sourceUrl: "", thumbnailUrl: "", _thumbFile: null, _thumbLocalPreview: null, _originalThumbnailUrl: "",
+    occasion: [], season: [], colors: [], notes: "", dateAdded: todayISO(), status: "saved", resultDesignId: null, aiAnalyzedAt: null
   };
 }
 function initWishlistDraft(existingId) {
@@ -1057,6 +1221,7 @@ function initWishlistDraft(existingId) {
     const existing = state.wishlist.find(function (w) { return w.id === existingId; });
     wishDraft = existing ? Object.assign(makeDefaultWishDraft(), JSON.parse(JSON.stringify(existing))) : makeDefaultWishDraft();
     wishDraft.season = seasonArray(wishDraft);
+    wishDraft._originalThumbnailUrl = wishDraft.thumbnailUrl;
   } else {
     wishDraft = makeDefaultWishDraft();
   }
@@ -1154,13 +1319,16 @@ function bindWishlistFormEvents(existingId) {
           id: wishDraft.id, title: title, sourceUrl: wishDraft.sourceUrl || "", thumbnailUrl: thumbnailUrl || "",
           occasion: wishDraft.occasion, season: wishDraft.season, colors: wishDraft.colors,
           notes: wishDraft.notes, dateAdded: wishDraft.dateAdded || todayISO(), status: wishDraft.status || "saved",
-          resultDesignId: wishDraft.resultDesignId || null, updatedAt: Date.now()
+          resultDesignId: wishDraft.resultDesignId || null,
+          aiAnalyzedAt: thumbnailUrl && thumbnailUrl !== wishDraft._originalThumbnailUrl ? null : (wishDraft.aiAnalyzedAt || null),
+          updatedAt: Date.now()
         };
         upsertWishlist(item);
         if (wishDraft._thumbLocalPreview) URL.revokeObjectURL(wishDraft._thumbLocalPreview);
         wishDraft = null;
         navigate("#/wishlist/" + item.id);
         showToast(isNew ? "Added to your wishlist" : "Wishlist item updated");
+        scheduleGeminiQueue();
       }).catch(function () {
         showToast("Could not save — check your connection and try again.", { error: true });
         saveBtn.disabled = false; saveBtn.textContent = "Save";
@@ -1190,6 +1358,7 @@ function submitPasscode() {
     showApp();
     connectCloud(hash);
     renderRoute();
+    scheduleGeminiQueue();
   }).catch(function () {
     errEl.hidden = false; errEl.textContent = "Couldn't unlock on this device — try again.";
   });
@@ -1223,6 +1392,7 @@ function wireStaticUI() {
     const root = document.getElementById("view-root");
     if (root) root.scrollTop = 0;
   });
+  window.addEventListener("online", scheduleGeminiQueue);
 }
 function boot() {
   wireStaticUI();
@@ -1232,6 +1402,7 @@ function boot() {
       connectCloud(REQUIRE_PASSCODE && savedHash ? savedHash : DEFAULT_CLOUD_DOC);
     }
     renderRoute();
+    scheduleGeminiQueue();
   } else {
     showLock();
   }

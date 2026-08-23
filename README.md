@@ -66,6 +66,38 @@ stored secret. This is the same model
 [Kev's Cellar](https://github.com/kristaamc-lab/Kevs-Cellar) uses, just
 turned on by default here.
 
+## Gemini photo reading (optional)
+
+When you add or edit a design/wishlist photo, Gemini looks at it afterwards
+and fills in whatever tags (occasion, season, colors, technique, shape),
+title, and notes you left blank — a step up from OCR, since it's reading
+the actual manicure rather than any text in the shot. It never overwrites a
+field you've already filled in, and it never blocks saving: the read
+happens in the background, on the already-saved photo.
+
+This uses [Firebase AI Logic](https://firebase.google.com/docs/ai-logic)
+against the Gemini Developer API backend, which — like Firestore above —
+stays on the free Spark plan and reuses the same `FIREBASE_CONFIG`, no
+separate API key needed. To turn it on:
+
+1. In the Firebase console, go to **Build → AI Logic** and click **Get
+   started**. Choose the **Gemini Developer API** option (not Vertex AI —
+   that one requires the paid Blaze plan).
+2. That's it — no code changes. `GEMINI_ENABLED` in `app.js` follows
+   `FIREBASE_ENABLED` automatically. Skip this section entirely and the
+   app just never auto-fills tags.
+
+**Offline behavior:** if a photo is saved with no connection, the read
+simply doesn't happen yet — nothing is lost or needs re-triggering by
+hand. Every design/wishlist item that has a photo but hasn't been read yet
+gets picked up automatically the next time the app is online (on
+reconnect, on next launch, or right after the save if you're already
+online), because "needs reading" is just a field on the item itself
+(`aiAnalyzedAt`), not a separate queue — it rides along with the same
+local-first storage and cross-device sync the rest of the app already
+uses. The design/wishlist detail view shows a small "Offline — will read
+the photo once you're back online" note while a photo is waiting.
+
 ## Data model
 
 - `designs` — one Firestore document per logged manicure: photo (embedded
@@ -76,6 +108,9 @@ turned on by default here.
   thumbnail (same embedded-photo approach), same occasion/season/colors
   taxonomy, notes, status (`saved`/`tried`), and `resultDesignId` once
   marked tried.
+
+Both also carry `aiAnalyzedAt` — null while Gemini still needs to read the
+photo (see "Gemini photo reading" above), a timestamp once it has.
 
 Photos are compressed client-side (resized to ~800px long edge, JPEG ~0.6
 quality, shrinking further in a couple of steps if needed) and embedded

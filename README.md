@@ -28,10 +28,18 @@ devices when online.
   - *Near* — a saved home neighborhood, "where I am" (lets the Maps app
     use the phone's location — no permission prompt here), or anywhere
     else; plus free-text extras and an "open now" toggle.
-  - The search opens Google Maps with the built query (plus one-term
-    searches when several terms are picked). There's no Places API key
-    or billing involved — ratings and reviews are read in Maps itself.
-    Search criteria are remembered per device and don't sync.
+  - Without a Places API key, the search opens Google Maps with the built
+    query (plus one-term searches when several terms are picked) —
+    ratings and reviews are read in Maps itself. Search criteria are
+    remembered per device and don't sync.
+  - With a Places API key (see "Google ratings in the Salons tab" below),
+    **Find salons** shows ranked results in the app: Google stars and
+    review counts, price, open-now, distance, and a "Why we picked it"
+    box for each place — the rating, how far it is, which of her terms
+    the shared reviews mention (with the matching words highlighted in a
+    quote), and a heads-up if some shared reviews are 1–2★. Extra
+    criteria appear: distance (1/2/5 miles) and minimum Google rating.
+    Results can be saved straight into My salons.
   - *My salons* — save a place as Want to try / Tried / Favorite with
     its Maps link and notes. Designs whose Location matches a saved
     salon's name show up on that salon (the design form suggests saved
@@ -84,6 +92,29 @@ stored secret. This is the same model
 [Kev's Cellar](https://github.com/kristaamc-lab/Kevs-Cellar) uses, just
 turned on by default here.
 
+## Google ratings in the Salons tab (optional)
+
+Off by default (`PLACES_API_KEY` is a placeholder in `app.js`). To turn it on:
+
+1. Create a **separate** Google Cloud project for Maps — don't add billing
+   to the `nail-journal` Firebase project, which would take it off the
+   free Spark plan.
+2. Enable billing on the Maps project and enable **Places API (New)**.
+3. Create an API key restricted to **Websites** (`https://nail-journal.web.app/*`,
+   `https://nail-journal.firebaseapp.com/*`) and to **Places API (New)** only.
+4. Set a daily quota on Text Search and a small budget alert (e.g. $1/month).
+5. Put the key in `PLACES_API_KEY` in `app.js` and redeploy.
+
+How it's used: one **Text Search** call per search (requesting reviews, which
+puts it in Google's top "Enterprise + Atmosphere" billing tier), one extra
+call the first time a typed neighborhood is turned into coordinates (then
+remembered), and one **Place Details** call when a saved salon's page opens.
+The app also stops after `PLACES_DAILY_CALL_LIMIT` (60) calls per device per
+day. Ranking: Google rating pulled toward a typical 4.3 when there are few
+reviews (45%), how many of her terms the reviews mention (35%), distance
+(20%). Saved salons store only name, address, Maps link and Google place ID —
+ratings and reviews are never saved, only fetched live.
+
 ## Data model
 
 - `designs` — one Firestore document per logged manicure: photo (embedded
@@ -95,7 +126,7 @@ turned on by default here.
   taxonomy, notes, status (`saved`/`tried`), and `resultDesignId` once
   marked tried.
 - `salons` — one document per saved salon: name, neighborhood, optional
-  Google Maps link, status (`want`/`tried`/`favorite`), notes. Linked to
+  Google Maps link and Google place ID (when saved from in-app results), status (`want`/`tried`/`favorite`), notes. Linked to
   designs by name via the design's `location`, not by ID.
 
 **Upgrading an existing deploy:** the `salons` subcollection needs the

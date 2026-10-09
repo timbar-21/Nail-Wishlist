@@ -1518,7 +1518,11 @@ function geocodePhrase(phrase) {
 function resolveSearchOrigin(s) {
   if (s.near === "me") return getDeviceLocation().then(function (c) { return { coords: c, label: "you" }; });
   const phrase = (s.near === "home" ? s.home : s.other).trim();
-  if (!phrase) return Promise.reject(friendlyError(s.near === "home" ? "Type your home neighborhood above first." : "Type a place to search near first."));
+  if (!phrase) {
+    const e = friendlyError(s.near === "home" ? "Type your home neighborhood in the box above first, then tap Find salons again." : "Type a place to search near in the box above first, then tap Find salons again.");
+    e.focusId = s.near === "home" ? "salon-home" : "salon-other";
+    return Promise.reject(e);
+  }
   return geocodePhrase(phrase).then(function (c) {
     if (!c) throw friendlyError("Couldn't find “" + phrase + "” — try a neighborhood or cross streets.");
     return { coords: c, label: s.near === "home" ? "home" : phrase };
@@ -1719,7 +1723,17 @@ function runSalonSearch(wide) {
     if (seq !== salonSearchSeq) return;
     salonResults = { error: friendlyPlacesError(err) };
     renderSalonResults();
+    if (err.focusId) focusSalonField(err.focusId);
   });
+}
+/* A missing home/place is the one error with an obvious fix, so take her
+   straight to the empty box instead of leaving her to scroll up for it. */
+function focusSalonField(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.scrollIntoView({ block: "center", behavior: "smooth" });
+  el.focus({ preventScroll: true });
+  shakeField(el);
 }
 function findSavedSalon(place) {
   const n = normalizeName(place.name);

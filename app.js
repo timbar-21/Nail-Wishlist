@@ -38,6 +38,21 @@ const FIREBASE_ENABLED = !!(FIREBASE_CONFIG.apiKey && FIREBASE_CONFIG.apiKey.ind
 const REQUIRE_PASSCODE = true;
 const DEFAULT_CLOUD_DOC = "shared";
 
+/* Google Places API (New) — turns the Salons tab from "open a Google Maps
+   search" into in-app results with Google star ratings and a "why we
+   picked it" explanation. Leave the placeholder as-is and the tab keeps
+   working with plain Google Maps links. Like the Firebase config above,
+   this key is meant to be public: it lives in a separate Google Cloud
+   project and is locked to this site's domains and to the Places API, with
+   daily quotas and a budget alert set there. The call cap below is one more
+   safety net, counted per device per day (a search is 1 call; a newly typed
+   neighborhood costs 1 more, once; opening a saved salon is 1). */
+const PLACES_API_KEY = "YOUR_PLACES_API_KEY";
+const PLACES_ENABLED = !!(PLACES_API_KEY && PLACES_API_KEY.indexOf("YOUR_") !== 0);
+const PLACES_BASE = "https://places.googleapis.com/v1";
+const PLACES_DAILY_CALL_LIMIT = 60;
+const PLACES_USAGE_KEY = "krista-nail-journal-places-usage";
+
 /* ── taxonomy ──────────────────────────────────────────────── */
 const OCCASIONS = ["Wedding", "Holiday", "Vacation", "Everyday", "Date Night", "Interview"];
 const SEASONS = ["Spring", "Summer", "Fall", "Winter"];
@@ -162,7 +177,7 @@ function saveStoreLocal() {
 function loadSalonSearch() {
   let s = {};
   try { s = JSON.parse(window.localStorage.getItem(SALON_SEARCH_KEY)) || {}; } catch (e) {}
-  return Object.assign({ near: "home", home: "", other: "", selected: null, extras: "", openNow: false }, s);
+  return Object.assign({ near: "home", home: "", other: "", selected: null, extras: "", openNow: false, minRating: 0, radiusMi: 2, coords: {} }, s);
 }
 function saveSalonSearch() {
   try { window.localStorage.setItem(SALON_SEARCH_KEY, JSON.stringify(state.salonSearch)); } catch (e) {}
@@ -1314,7 +1329,7 @@ function profileSummaryText(p) {
   return "From your " + sources.join(" and ") + ": " + parts.join(", ") + ".";
 }
 
-/* ── salon search (Google Maps links) ──────────────────────── */
+/* ── salon search (criteria + Google Maps links) ──────────────────────── */
 const SALON_TERM_GROUPS = [
   { kind: "technique", label: "Technique", tone: "pink", options: Object.keys(TECHNIQUE_SEARCH_TERMS) },
   { kind: "style", label: "Style", tone: "sage", options: NAIL_STYLES.map(function (st) { return st.id; }) },
@@ -1398,6 +1413,407 @@ function getSalonOrderedList() {
   });
 }
 
+/* ── Google Places (in-app results) ────────────────────────── */
+/* Only runs when PLACES_ENABLED. One search = one Text Search call (plus
+   a one-off call to turn a typed neighborhood into coordinates, which is
+   remembered). Everything below the network functions is plain data in,
+   data out, so the ranking and the "why" text are easy to test. */
+const PRICE_LABELS = { PRICE_LEVEL_INEXPENSIVE: "$", PRICE_LEVEL_MODERATE: "$$", PRICE_LEVEL_EXPENSIVE: "$$$", PRICE_LEVEL_VERY_EXPENSIVE: "$$$$" };
+const TECHNIQUE_REVIEW_PATTERNS = {
+  "Gel": /\bgel\b|gel[- ]?x|builder gel/i,
+  "Acrylic": /acrylics?\b/i,
+  "Dip Powder": /\bdip\b|dip powder|\bsns\b/i,
+  "Regular Polish": /regular (polish|mani)|classic mani|polish change/i
+};
+const RATING_FILTERS = [[0, "Any"], [4, "4.0+"], [4.5, "4.5+"]];
+const RADIUS_OPTIONS = [[1, "1 mile"], [2, "2 miles"], [5, "5 miles"]];
+/* A rating from a handful of reviews is weak evidence, so each place is
+   pulled toward a typical 4.3 as if it had 50 extra reviews at that
+   average: 4.9 from 12 reviews lands below 4.7 from 900. */
+const REVIEW_PRIOR = { mean: 4.3, weight: 50 };
+const RANK_WEIGHTS = { quality: 0.45, match: 0.35, distance: 0.2 };
+const PLACES_SEARCH_FIELDS = [
+  "id", "displayName", "formattedAddress", "shortFormattedAddress", "location", "rating", "userRatingCount",
+  "priceLevel", "currentOpeningHours.openNow", "googleMapsUri", "websiteUri", "nationalPhoneNumber",
+  "editorialSummary", "reviews", "businessStatus"
+].map(function (f) { return "places." + f; }).join(",");
+const PLACES_DETAIL_FIELDS = "rating,userRatingCount,priceLevel,currentOpeningHours.openNow";
+
+function clamp01(x) { return Math.max(0, Math.min(1, x)); }
+function escapeRegExp(str) { return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+function friendlyError(message) { const e = new Error(message); e.friendly = message; return e; }
+function haversineMi(a, b) {
+  const R = 3958.8, rad = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * rad, dLng = (b.lng - a.lng) * rad;
+  const h = Math.pow(Math.sin(dLat / 2), 2) + Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.pow(Math.sin(dLng / 2), 2);
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+/* A hard daily ceiling on billable calls from this device, on top of the
+   quotas and budget set in Google Cloud — a belt-and-braces cap. */
+function placesUsage() {
+  const today = todayISO();
+  let u = null;
+  try { u = JSON.parse(window.localStorage.getItem(PLACES_USAGE_KEY)); } catch (e) {}
+  return u && u.day === today ? u : { day: today, n: 0 };
+}
+function placesCallsLeft() { return Math.max(0, PLACES_DAILY_CALL_LIMIT - placesUsage().n); }
+function placesCountCall() {
+  const u = placesUsage();
+  u.n += 1;
+  try { window.localStorage.setItem(PLACES_USAGE_KEY, JSON.stringify(u)); } catch (e) {}
+}
+function placesRequest(path, fieldMask, body) {
+  if (placesCallsLeft() < 1) { const e = new Error("daily limit"); e.code = "limit"; return Promise.reject(e); }
+  placesCountCall();
+  const init = { headers: { "X-Goog-Api-Key": PLACES_API_KEY, "X-Goog-FieldMask": fieldMask } };
+  if (body) {
+    init.method = "POST";
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
+  return fetch(PLACES_BASE + path, init).then(function (res) {
+    if (res.ok) return res.json();
+    return res.json().catch(function () { return {}; }).then(function (data) {
+      const e = new Error((data.error && data.error.message) || ("HTTP " + res.status));
+      e.status = res.status;
+      throw e;
+    });
+  });
+}
+function friendlyPlacesError(err) {
+  if (err.friendly) return err.friendly;
+  if (err.code === "limit") return "That's today's search limit for this app (a safety cap to avoid charges). Try again tomorrow, or use Google Maps below.";
+  if (err.status === 401 || err.status === 403) return "Google turned the request down (" + err.status + "). Check that the API key allows this website and the Places API (New).";
+  if (err.status === 429) return "Too many searches at once — wait a minute and try again.";
+  if (err.status) return "Google couldn't run that search (" + err.status + "): " + String(err.message).slice(0, 140);
+  return "Couldn't reach Google — check your connection and try again.";
+}
+
+function getDeviceLocation() {
+  return new Promise(function (resolve, reject) {
+    const msg = "Couldn't get your location — allow location access for this site, or pick Home or Somewhere else.";
+    if (!navigator.geolocation) { reject(friendlyError(msg)); return; }
+    navigator.geolocation.getCurrentPosition(
+      function (pos) { resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }); },
+      function () { reject(friendlyError(msg)); },
+      { timeout: 10000, maximumAge: 300000 }
+    );
+  });
+}
+/* A typed neighborhood becomes coordinates once and is remembered, so
+   the search can bias toward it and measure real distances. */
+function geocodePhrase(phrase) {
+  const cache = state.salonSearch.coords, key = phrase.toLowerCase();
+  if (cache[key]) return Promise.resolve(cache[key]);
+  return placesRequest("/places:searchText", "places.location", { textQuery: phrase, pageSize: 1 }).then(function (data) {
+    const p = (data.places || [])[0];
+    if (!p || !p.location) return null;
+    const c = { lat: p.location.latitude, lng: p.location.longitude };
+    cache[key] = c;
+    saveSalonSearch();
+    return c;
+  });
+}
+function resolveSearchOrigin(s) {
+  if (s.near === "me") return getDeviceLocation().then(function (c) { return { coords: c, label: "you" }; });
+  const phrase = (s.near === "home" ? s.home : s.other).trim();
+  if (!phrase) return Promise.reject(friendlyError(s.near === "home" ? "Type your home neighborhood above first." : "Type a place to search near first."));
+  return geocodePhrase(phrase).then(function (c) {
+    if (!c) throw friendlyError("Couldn't find “" + phrase + "” — try a neighborhood or cross streets.");
+    return { coords: c, label: s.near === "home" ? "home" : phrase };
+  });
+}
+
+/* ── turning criteria into matchers, and results into a ranking ── */
+function reviewMatchers(s, selectedKeys) {
+  const order = SALON_TERM_GROUPS.map(function (g) { return g.kind; });
+  const out = selectedKeys.slice()
+    .sort(function (a, b) { return order.indexOf(a.split(":")[0]) - order.indexOf(b.split(":")[0]); })
+    .map(function (key) {
+      const i = key.indexOf(":"), kind = key.slice(0, i), value = key.slice(i + 1);
+      let pattern = null;
+      if (kind === "technique") pattern = TECHNIQUE_REVIEW_PATTERNS[value];
+      else if (kind === "style") { const st = NAIL_STYLES.find(function (x) { return x.id === value; }); pattern = st && st.pattern; }
+      else if (kind === "shape" && SHAPES.indexOf(value) >= 0) pattern = new RegExp("\\b" + escapeRegExp(value) + "\\b", "i");
+      return pattern ? { key: key, label: value.toLowerCase(), pattern: pattern } : null;
+    }).filter(Boolean);
+  const extras = s.extras.trim();
+  if (extras && extras.length <= 40) out.push({ key: "extras", label: extras.toLowerCase(), pattern: new RegExp(escapeRegExp(extras), "i") });
+  return out;
+}
+function placesTextQuery(s, selectedKeys, wide) {
+  if (wide) return "nail salon";
+  const terms = selectedKeys.slice()
+    .sort(function (a, b) { return SALON_TERM_GROUPS.findIndex(function (g) { return g.kind === a.split(":")[0]; }) - SALON_TERM_GROUPS.findIndex(function (g) { return g.kind === b.split(":")[0]; }); })
+    .map(salonSearchTerm).filter(Boolean).slice(0, 2);
+  const extras = s.extras.trim();
+  return ["nail salon"].concat(terms, extras ? [extras] : []).join(" ");
+}
+function normalizePlace(p, originCoords) {
+  if (!p || !p.id) return null;
+  if (p.businessStatus && p.businessStatus !== "OPERATIONAL") return null;
+  const loc = p.location ? { lat: p.location.latitude, lng: p.location.longitude } : null;
+  return {
+    placeId: p.id,
+    name: (p.displayName && p.displayName.text) || "",
+    address: p.shortFormattedAddress || p.formattedAddress || "",
+    rating: typeof p.rating === "number" ? p.rating : null,
+    count: p.userRatingCount || 0,
+    price: PRICE_LABELS[p.priceLevel] || "",
+    openNow: p.currentOpeningHours && typeof p.currentOpeningHours.openNow === "boolean" ? p.currentOpeningHours.openNow : null,
+    mapsUrl: safeHttpUrl(p.googleMapsUri),
+    website: safeHttpUrl(p.websiteUri),
+    phone: String(p.nationalPhoneNumber || ""),
+    summary: (p.editorialSummary && p.editorialSummary.text) || "",
+    reviews: (p.reviews || []).map(function (r) {
+      return {
+        text: (r.text && r.text.text) || (r.originalText && r.originalText.text) || "",
+        rating: r.rating || 0,
+        author: (r.authorAttribution && r.authorAttribution.displayName) || "",
+        authorUrl: safeHttpUrl(r.authorAttribution && r.authorAttribution.uri),
+        when: r.relativePublishTimeDescription || ""
+      };
+    }),
+    distanceMi: originCoords && loc ? haversineMi(originCoords, loc) : null
+  };
+}
+function bayesRating(rating, count) {
+  return (count * rating + REVIEW_PRIOR.weight * REVIEW_PRIOR.mean) / (count + REVIEW_PRIOR.weight);
+}
+function qualityScore(place) {
+  if (!place.rating || !place.count) return 0;
+  return clamp01((bayesRating(place.rating, place.count) - 3.6) / 1.3);
+}
+function distanceScore(place, radiusMi) {
+  return place.distanceMi == null ? null : clamp01(1 - place.distanceMi / (radiusMi * 1.5));
+}
+/* For each thing she's after: how many of the shared reviews mention it,
+   and whether the listing itself (name / Google's summary) does. */
+function analyzePlace(place, matchers) {
+  const listing = place.name + " " + place.summary;
+  return matchers.map(function (m) {
+    let n = 0;
+    place.reviews.forEach(function (r) { if (m.pattern.test(r.text)) n++; });
+    return { label: m.label, reviewHits: n, inListing: m.pattern.test(listing) };
+  });
+}
+function matchScore(terms) {
+  if (!terms.length) return null;
+  const total = terms.reduce(function (sum, t) { return sum + Math.min(1, (t.reviewHits + (t.inListing ? 1 : 0)) / 2); }, 0);
+  return total / terms.length;
+}
+function scorePlace(place, matchers, radiusMi) {
+  const terms = analyzePlace(place, matchers);
+  const quality = qualityScore(place), match = matchScore(terms), dist = distanceScore(place, radiusMi);
+  const parts = [{ v: quality, w: RANK_WEIGHTS.quality }];
+  if (match != null) parts.push({ v: match, w: RANK_WEIGHTS.match });
+  if (dist != null) parts.push({ v: dist, w: RANK_WEIGHTS.distance });
+  const wsum = parts.reduce(function (s, p) { return s + p.w; }, 0);
+  const score = parts.reduce(function (s, p) { return s + p.v * p.w; }, 0) / wsum;
+  return { score: score, terms: terms, quality: quality, match: match, distance: dist };
+}
+function rankPlaces(places, matchers, opts) {
+  let hiddenFar = 0;
+  const items = [];
+  places.forEach(function (p) {
+    if (opts.minRating > 0 && (p.rating == null || p.rating < opts.minRating)) return;
+    if (p.distanceMi != null && p.distanceMi > opts.radiusMi) { hiddenFar++; return; }
+    items.push({ place: p, analysis: scorePlace(p, matchers, opts.radiusMi) });
+  });
+  items.sort(function (a, b) { return b.analysis.score - a.analysis.score || b.place.count - a.place.count; });
+  return { items: items, hiddenFar: hiddenFar };
+}
+
+/* ── the "why we're suggesting it" text ────────────────────── */
+function whyFor(item, originLabel) {
+  const p = item.place, a = item.analysis, bullets = [];
+  if (p.rating) {
+    let t = p.rating.toFixed(1) + "★ from " + p.count.toLocaleString() + " Google reviews";
+    if (p.count >= 200 && bayesRating(p.rating, p.count) >= 4.6) t += " — consistently well rated";
+    else if (p.count < 30) t += " — only a few reviews so far, so take it lightly";
+    bullets.push(t);
+  } else {
+    bullets.push("No Google rating yet");
+  }
+  if (p.distanceMi != null) {
+    bullets.push((p.distanceMi < 0.1 ? "Under 0.1" : p.distanceMi.toFixed(1)) + " mi from " + originLabel);
+  }
+  if (a.terms.length) {
+    const hit = a.terms.filter(function (t) { return t.reviewHits > 0 || t.inListing; });
+    if (hit.length) {
+      bullets.push("Reviews mention " + hit.map(function (t) {
+        return t.reviewHits ? t.label + " (" + t.reviewHits + " of " + p.reviews.length + ")" : t.label + " (in its listing)";
+      }).join(", "));
+    } else {
+      bullets.push("None of the reviews Google shared mention " + a.terms.map(function (t) { return t.label; }).join(" or ") + " — ranked on rating and distance");
+    }
+  }
+  const low = p.reviews.filter(function (r) { return r.rating && r.rating <= 2; }).length;
+  return { bullets: bullets, caution: low ? plural(low, "of the " + p.reviews.length + " reviews shared") + " " + (low === 1 ? "is" : "are") + " 1–2★" : "" };
+}
+function pickQuote(place, matchers) {
+  let best = null;
+  place.reviews.forEach(function (r) {
+    if (!r.text || r.text.length < 25 || r.rating < 4) return;
+    const hits = matchers.filter(function (m) { return m.pattern.test(r.text); }).length;
+    const sc = hits * 10 + r.rating + Math.min(r.text.length, 300) / 1000;
+    if (!best || sc > best.sc) best = { sc: sc, review: r };
+  });
+  return best && best.review;
+}
+function quoteHTML(text, matchers) {
+  text = String(text).replace(/\s+/g, " ").trim();
+  const source = matchers.map(function (m) { return m.pattern.source; }).join("|");
+  let start = 0;
+  if (source) {
+    const first = new RegExp(source, "i").exec(text);
+    if (first && first.index > 90) start = text.indexOf(" ", first.index - 70) + 1;
+  }
+  let end = Math.min(text.length, start + 200);
+  if (end < text.length && text.lastIndexOf(" ", end) > start) end = text.lastIndexOf(" ", end);
+  const slice = text.slice(start, end);
+  let html = "", last = 0;
+  if (source) {
+    const re = new RegExp(source, "gi");
+    let m;
+    while ((m = re.exec(slice)) !== null) {
+      if (!m[0].length) { re.lastIndex++; continue; }
+      html += esc(slice.slice(last, m.index)) + "<mark>" + esc(m[0]) + "</mark>";
+      last = m.index + m[0].length;
+    }
+  }
+  html += esc(slice.slice(last));
+  return (start > 0 ? "…" : "") + html + (end < text.length ? "…" : "");
+}
+
+/* ── running a search, and showing the results ─────────────── */
+let salonResults = null, salonSearchSeq = 0;
+const placeLiveCache = {};
+
+function runSalonSearch(wide) {
+  const s = state.salonSearch;
+  const selected = selectedSalonTerms(buildNailProfile(state.designs, state.wishlist));
+  const matchers = reviewMatchers(s, selected);
+  const seq = ++salonSearchSeq;
+  salonResults = { loading: true };
+  renderSalonResults();
+  resolveSearchOrigin(s).then(function (origin) {
+    const body = {
+      textQuery: placesTextQuery(s, selected, wide), pageSize: 20,
+      locationBias: { circle: { center: { latitude: origin.coords.lat, longitude: origin.coords.lng }, radius: Math.min(s.radiusMi * 1609.34, 50000) } }
+    };
+    if (s.openNow) body.openNow = true;
+    if (s.minRating > 0) body.minRating = s.minRating;
+    return placesRequest("/places:searchText", PLACES_SEARCH_FIELDS, body).then(function (data) { return { data: data, origin: origin }; });
+  }).then(function (res) {
+    if (seq !== salonSearchSeq) return;
+    const places = (res.data.places || []).map(function (p) { return normalizePlace(p, res.origin.coords); }).filter(Boolean);
+    const ranked = rankPlaces(places, matchers, { minRating: s.minRating, radiusMi: s.radiusMi });
+    salonResults = {
+      items: ranked.items, hiddenFar: ranked.hiddenFar, matchers: matchers, originLabel: res.origin.label,
+      wide: !!wide, stale: false, radiusMi: s.radiusMi
+    };
+    renderSalonResults();
+  }).catch(function (err) {
+    if (seq !== salonSearchSeq) return;
+    salonResults = { error: friendlyPlacesError(err) };
+    renderSalonResults();
+  });
+}
+function findSavedSalon(place) {
+  const n = normalizeName(place.name);
+  return state.salons.find(function (x) { return x.placeId === place.placeId || (n && normalizeName(x.name) === n); }) || null;
+}
+function savePlace(placeId) {
+  const item = salonResults && salonResults.items && salonResults.items.find(function (it) { return it.place.placeId === placeId; });
+  if (!item || findSavedSalon(item.place)) return;
+  const p = item.place;
+  upsertSalon({
+    id: uid(), name: p.name, neighborhood: p.address, mapsUrl: p.mapsUrl, placeId: p.placeId,
+    status: "want", notes: "", dateAdded: todayISO(), updatedAt: Date.now()
+  });
+  showToast("Saved to My salons");
+  renderSalonResults();
+}
+function starsHTML(rating, count) {
+  return rating
+    ? '<span class="stars">★ ' + rating.toFixed(1) + '</span><span class="star-count">(' + count.toLocaleString() + ")</span>"
+    : '<span class="star-count">No rating yet</span>';
+}
+function placeCardHTML(item, rank, ctx) {
+  const p = item.place, why = whyFor(item, ctx.originLabel), quote = pickQuote(p, ctx.matchers);
+  const saved = findSavedSalon(p);
+  const meta = [
+    p.price ? esc(p.price) : "",
+    p.openNow === true ? '<span class="open-now">Open now</span>' : p.openNow === false ? "Closed now" : "",
+    p.distanceMi != null ? (p.distanceMi < 0.1 ? "<0.1" : p.distanceMi.toFixed(1)) + " mi" : ""
+  ].filter(Boolean).join(" · ");
+  const phone = p.phone.replace(/[^0-9+]/g, "");
+  return '<div class="result-card">' +
+    '<div class="result-head"><div class="result-name">' + esc(p.name) + "</div>" +
+      (rank === 0 ? '<span class="top-pick">Top pick</span>' : "") + "</div>" +
+    '<div class="result-rating">' + starsHTML(p.rating, p.count) + (meta ? '<span class="result-meta">' + meta + "</span>" : "") + "</div>" +
+    (p.address ? '<div class="result-address">' + esc(p.address) + "</div>" : "") +
+    '<div class="why-box"><div class="why-title">Why we picked it</div><ul class="why-list">' +
+      why.bullets.map(function (b) { return "<li>" + esc(b) + "</li>"; }).join("") +
+      (why.caution ? '<li class="why-caution">Heads up: ' + esc(why.caution) + "</li>" : "") + "</ul></div>" +
+    (quote ? '<blockquote class="review-quote">“' + quoteHTML(quote.text, ctx.matchers) + "”" +
+      '<cite>— ' + (quote.authorUrl ? '<a href="' + esc(quote.authorUrl) + '" target="_blank" rel="noopener">' + esc(quote.author || "A Google reviewer") + "</a>" : esc(quote.author || "A Google reviewer")) +
+      (quote.when ? ", " + esc(quote.when) : "") + "</cite></blockquote>" : "") +
+    '<div class="result-actions">' +
+      (saved ? '<button type="button" class="btn btn-secondary btn-sm" data-open-salon="' + esc(saved.id) + '">Saved ✓</button>'
+             : '<button type="button" class="btn btn-primary btn-sm" data-save-place="' + esc(p.placeId) + '">Save</button>') +
+      (p.mapsUrl ? '<a class="btn btn-outline btn-sm" href="' + esc(p.mapsUrl) + '" target="_blank" rel="noopener">Maps</a>' : "") +
+      (phone ? '<a class="btn btn-outline btn-sm" href="tel:' + esc(phone) + '">Call</a>' : "") +
+      (p.website ? '<a class="btn btn-outline btn-sm" href="' + esc(p.website) + '" target="_blank" rel="noopener">Website</a>' : "") +
+    "</div></div>";
+}
+function renderSalonResults() {
+  const el = document.getElementById("salon-results");
+  if (!el) return;
+  const r = salonResults;
+  if (!r) { el.innerHTML = ""; return; }
+  if (r.loading) { el.innerHTML = '<div class="results-status"><span class="spinner"></span>Searching Google for salons…</div>'; return; }
+  if (r.error) { el.innerHTML = '<div class="results-status results-error">' + esc(r.error) + "</div>"; return; }
+  const widen = !r.wide && r.items.length < 8
+    ? '<button type="button" class="btn btn-secondary btn-block" id="salon-widen-btn" style="margin-top:var(--space-2);">Widen search (any nail salon)</button>' : "";
+  if (!r.items.length) {
+    el.innerHTML = '<div class="empty-state"><div class="empty-title">No salons matched</div>' +
+      '<div class="empty-body">Try a larger distance, a lower rating, or fewer terms.' + (r.hiddenFar ? " " + plural(r.hiddenFar, "result") + " fell outside your distance." : "") + "</div></div>" + widen;
+    return;
+  }
+  el.innerHTML = '<div class="filters-bar"><span class="result-line">' + plural(r.items.length, "salon") + ", best match first</span></div>" +
+    (r.stale ? '<div class="results-status">Your settings changed — tap <strong>Find salons</strong> to refresh.</div>' : "") +
+    r.items.map(function (it, i) { return placeCardHTML(it, i, r); }).join("") +
+    (r.hiddenFar ? '<div class="field-hint">' + plural(r.hiddenFar, "more result") + " hidden for being over " + r.radiusMi + " mi away.</div>" : "") +
+    widen +
+    '<div class="field-hint attribution">Ratings and reviews from Google Maps. “Why we picked it” reads the (up to 5) reviews Google shares for each place — not every review.</div>';
+}
+function liveRatingHTML(d) {
+  const open = d.currentOpeningHours && typeof d.currentOpeningHours.openNow === "boolean" ? d.currentOpeningHours.openNow : null;
+  return '<div class="result-rating">' + starsHTML(typeof d.rating === "number" ? d.rating : null, d.userRatingCount || 0) +
+    '<span class="result-meta">' + [PRICE_LABELS[d.priceLevel] || "", open === true ? '<span class="open-now">Open now</span>' : open === false ? "Closed now" : ""].filter(Boolean).join(" · ") + "</span></div>" +
+    '<div class="field-hint">Live from Google Maps</div>';
+}
+/* A saved salon only stores its name and Google place ID; the stars are
+   fetched fresh each time the page opens (and held in memory briefly). */
+function loadSalonLive(salon) {
+  const el = document.getElementById("salon-live");
+  if (!el || !PLACES_ENABLED || !salon.placeId) return;
+  const hit = placeLiveCache[salon.placeId];
+  if (hit && Date.now() - hit.at < 30 * 60 * 1000) { el.innerHTML = liveRatingHTML(hit.data); return; }
+  el.innerHTML = '<div class="field-hint">Checking Google…</div>';
+  placesRequest("/places/" + encodeURIComponent(salon.placeId), PLACES_DETAIL_FIELDS, null).then(function (data) {
+    placeLiveCache[salon.placeId] = { at: Date.now(), data: data };
+    const cur = document.getElementById("salon-live");
+    if (cur && cur.dataset.placeId === salon.placeId) cur.innerHTML = liveRatingHTML(data);
+  }).catch(function () {
+    const cur = document.getElementById("salon-live");
+    if (cur && cur.dataset.placeId === salon.placeId) cur.innerHTML = "";
+  });
+}
+
 /* ── salons tab ────────────────────────────────────────────── */
 function salonsHTML() {
   const s = state.salonSearch;
@@ -1430,19 +1846,39 @@ function salonsHTML() {
       '<input class="form-input salon-near-input" id="salon-home" placeholder="Home neighborhood or cross streets, e.g. Williamsburg, Brooklyn" value="' + esc(s.home) + '"' + (s.near === "home" ? "" : " hidden") + ">" +
       '<input class="form-input salon-near-input" id="salon-other" placeholder="Neighborhood, address or landmark" value="' + esc(s.other) + '"' + (s.near === "other" ? "" : " hidden") + ">" +
     "</div>" +
+    (PLACES_ENABLED
+      ? '<div class="form-section"><label class="form-label">How far</label><div class="chip-row">' +
+          RADIUS_OPTIONS.map(function (o) { return chipHTML("radius", String(o[0]), o[1], s.radiusMi === o[0], "neutral", "salon-radius"); }).join("") + "</div></div>" +
+        '<div class="form-section"><label class="form-label">Google rating</label><div class="chip-row">' +
+          RATING_FILTERS.map(function (o) { return chipHTML("rating", String(o[0]), o[1], s.minRating === o[0], "neutral", "salon-rating"); }).join("") + "</div></div>"
+      : "") +
     '<div class="form-section"><label class="form-label">Anything else?</label>' +
       '<input class="form-input" id="salon-extras" placeholder="e.g. pedicure, walk-ins, non-toxic" value="' + esc(s.extras) + '"></div>' +
     '<div class="form-section"><div class="toggle-row"><span>Open now</span><label class="switch">' +
       '<input type="checkbox" id="salon-open-now"' + (s.openNow ? " checked" : "") + '><span class="switch-track"></span><span class="switch-thumb"></span></label></div></div>' +
     '<div id="salon-search-output"></div>' +
+    '<div id="salon-results"></div>' +
     '<h2 class="section-heading">My salons</h2>' +
     '<div class="filters-bar"><span class="result-line" id="salon-result-line"></span>' +
       '<button type="button" class="btn-text" id="salon-add-btn">+ Add salon</button></div>' +
     '<div id="salon-list"></div>';
 }
 function updateSalonSearchOutput() {
+  const s = state.salonSearch;
   const profile = buildNailProfile(state.designs, state.wishlist);
-  const q = buildSalonQueries(state.salonSearch, selectedSalonTerms(profile));
+  const selected = selectedSalonTerms(profile);
+  const q = buildSalonQueries(s, selected);
+  if (PLACES_ENABLED) {
+    const labels = reviewMatchers(s, selected).map(function (m) { return m.label; });
+    const where = s.near === "me" ? "near where you are"
+      : (s.near === "home" ? (s.home.trim() ? "near " + s.home.trim() : "near home (add it above)") : (s.other.trim() ? "near " + s.other.trim() : "(add a place above)"));
+    document.getElementById("salon-search-output").innerHTML = "" +
+      '<div class="query-preview">Looking for <strong>' + esc(labels.length ? labels.join(" + ") : "any nail salon") + "</strong> " + esc(where) +
+        " · within " + s.radiusMi + " mi" + (s.minRating ? " · " + s.minRating.toFixed(1) + "★+" : "") + (s.openNow ? " · open now" : "") + "</div>" +
+      '<button type="button" class="btn btn-primary btn-block" id="salon-find-btn">Find salons</button>' +
+      '<a class="btn btn-outline btn-block btn-link salon-maps-alt" href="' + esc(mapsSearchUrl(q.main)) + '" target="_blank" rel="noopener">Or search in Google Maps</a>';
+    return;
+  }
   document.getElementById("salon-search-output").innerHTML = "" +
     '<div class="query-preview">Searches Google Maps for <strong>&ldquo;' + esc(q.main) + "&rdquo;</strong></div>" +
     '<a class="btn btn-primary btn-block btn-link" href="' + esc(mapsSearchUrl(q.main)) + '" target="_blank" rel="noopener">Search Google Maps</a>' +
@@ -1479,9 +1915,33 @@ function updateSalonList() {
 function bindSalonsEvents() {
   updateSalonSearchOutput();
   updateSalonList();
+  renderSalonResults();
   const root = document.getElementById("view-root");
   const s = state.salonSearch;
-  function changed() { saveSalonSearch(); updateSalonSearchOutput(); }
+  function changed() {
+    saveSalonSearch();
+    updateSalonSearchOutput();
+    if (salonResults && salonResults.items && !salonResults.stale) { salonResults.stale = true; renderSalonResults(); }
+  }
+  [["salon-radius", "radiusMi"], ["salon-rating", "minRating"]].forEach(function (pair) {
+    root.querySelectorAll('[data-chip-mode="' + pair[0] + '"]').forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        s[pair[1]] = Number(btn.dataset.chipValue);
+        root.querySelectorAll('[data-chip-mode="' + pair[0] + '"]').forEach(function (b) { b.classList.toggle("active", b === btn); });
+        changed();
+      });
+    });
+  });
+  document.getElementById("salon-search-output").addEventListener("click", function (e) {
+    if (e.target.closest("#salon-find-btn")) runSalonSearch(false);
+  });
+  document.getElementById("salon-results").addEventListener("click", function (e) {
+    const save = e.target.closest("[data-save-place]");
+    if (save) { savePlace(save.dataset.savePlace); return; }
+    const open = e.target.closest("[data-open-salon]");
+    if (open) { navigate("#/salons/" + open.dataset.openSalon); return; }
+    if (e.target.closest("#salon-widen-btn")) runSalonSearch(true);
+  });
   root.querySelectorAll('[data-chip-mode="salon-term"]').forEach(function (btn) {
     btn.addEventListener("click", function () {
       const key = btn.dataset.chipGroup + ":" + btn.dataset.chipValue;
@@ -1523,6 +1983,7 @@ function salonDetailHTML(id) {
       '<button class="icon-btn" id="detail-delete" aria-label="Delete">' + trashSVG() + "</button></div></div>" +
     '<h2 class="salon-name">' + esc(salon.name) + "</h2>" +
     (salon.neighborhood ? '<div class="salon-neighborhood">' + esc(salon.neighborhood) + "</div>" : "") +
+    (PLACES_ENABLED && salon.placeId ? '<div id="salon-live" class="salon-live" data-place-id="' + esc(salon.placeId) + '"></div>' : "") +
     '<div class="chip-row salon-status-row">' +
       SALON_STATUSES.map(function (st) { return chipHTML("status", st.id, st.label, (salon.status || "want") === st.id, "pink", "salon-status"); }).join("") + "</div>" +
     '<div class="detail-actions salon-actions">' +
@@ -1554,6 +2015,7 @@ function bindSalonDetailEvents(id) {
     });
   });
   document.getElementById("salon-log-design").addEventListener("click", function () { navigate("#/design/new/at/" + id); });
+  loadSalonLive(salon);
   const grid = document.querySelector("#view-root .grid");
   if (grid) grid.addEventListener("click", function (e) {
     const card = e.target.closest("[data-open-design]");
@@ -1564,7 +2026,7 @@ function bindSalonDetailEvents(id) {
 /* ── add / edit salon ──────────────────────────────────────── */
 let salonDraft = null;
 function makeDefaultSalonDraft() {
-  return { id: uid(), name: "", neighborhood: "", mapsUrl: "", status: "want", notes: "", dateAdded: todayISO() };
+  return { id: uid(), name: "", neighborhood: "", mapsUrl: "", placeId: "", status: "want", notes: "", dateAdded: todayISO() };
 }
 function initSalonDraft(existingId) {
   const existing = existingId ? state.salons.find(function (x) { return x.id === existingId; }) : null;
@@ -1613,7 +2075,7 @@ function bindSalonFormEvents(existingId) {
       return;
     }
     const salon = {
-      id: salonDraft.id, name: name, neighborhood: salonDraft.neighborhood.trim(), mapsUrl: mapsUrl,
+      id: salonDraft.id, name: name, neighborhood: salonDraft.neighborhood.trim(), mapsUrl: mapsUrl, placeId: salonDraft.placeId || "",
       status: salonDraft.status || "want", notes: salonDraft.notes, dateAdded: salonDraft.dateAdded || todayISO(),
       updatedAt: Date.now()
     };

@@ -3,7 +3,7 @@
    worth caching. Firebase's CDN scripts are loaded on demand elsewhere
    and deliberately left out: they should fail gracefully offline (sync
    just won't work without a connection), not get force-cached stale. */
-const CACHE_NAME = "nail-journal-shell-v2";
+const CACHE_NAME = "nail-journal-shell-v3";
 const SHELL_FILES = [
   "./",
   "./index.html",

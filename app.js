@@ -47,7 +47,7 @@ const DEFAULT_CLOUD_DOC = "shared";
    daily quotas and a budget alert set there. The call cap below is one more
    safety net, counted per device per day (a search is 1 call; a newly typed
    neighborhood costs 1 more, once; opening a saved salon is 1). */
-const PLACES_API_KEY = "YOUR_PLACES_API_KEY";
+const PLACES_API_KEY = "AIzaSyAKJaWynLVJp827Jc2VGuv7pRLqkl1fKxM";
 const PLACES_ENABLED = !!(PLACES_API_KEY && PLACES_API_KEY.indexOf("YOUR_") !== 0);
 const PLACES_BASE = "https://places.googleapis.com/v1";
 const PLACES_DAILY_CALL_LIMIT = 60;

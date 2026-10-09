@@ -18,6 +18,24 @@ devices when online.
   notes.
 - **Wishlist** — separate list, "add via link" form, "mark as tried" (which
   promotes the item into a Gallery entry and auto-fills its tags).
+- **Salons** — a salon finder plus a saved-salon shortlist:
+  - *What you're after* — a nail profile learned from history: each
+    design votes for its technique, shape, and any styles its notes
+    mention (chrome, French, nail art…), weighted by rating (Love 3,
+    Like 2, Meh 0.5, Skip −1, +1 if "would repeat"); wishlist titles and
+    notes vote for styles too. The top technique and style are
+    preselected as search terms; every chip can be toggled.
+  - *Near* — a saved home neighborhood, "where I am" (lets the Maps app
+    use the phone's location — no permission prompt here), or anywhere
+    else; plus free-text extras and an "open now" toggle.
+  - The search opens Google Maps with the built query (plus one-term
+    searches when several terms are picked). There's no Places API key
+    or billing involved — ratings and reviews are read in Maps itself.
+    Search criteria are remembered per device and don't sync.
+  - *My salons* — save a place as Want to try / Tried / Favorite with
+    its Maps link and notes. Designs whose Location matches a saved
+    salon's name show up on that salon (the design form suggests saved
+    names), and logging a design at a "want to try" salon marks it tried.
 
 ## Setting up cross-device sync (Firebase)
 
@@ -76,6 +94,14 @@ turned on by default here.
   thumbnail (same embedded-photo approach), same occasion/season/colors
   taxonomy, notes, status (`saved`/`tried`), and `resultDesignId` once
   marked tried.
+- `salons` — one document per saved salon: name, neighborhood, optional
+  Google Maps link, status (`want`/`tried`/`favorite`), notes. Linked to
+  designs by name via the design's `location`, not by ID.
+
+**Upgrading an existing deploy:** the `salons` subcollection needs the
+updated `firestore.rules` published (`firebase deploy --only
+firestore:rules`, or paste it into the console). Until then designs and
+wishlist keep syncing as before and saved salons stay on each device.
 
 Photos are compressed client-side (resized to ~800px long edge, JPEG ~0.6
 quality, shrinking further in a couple of steps if needed) and embedded

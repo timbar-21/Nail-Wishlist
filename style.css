@@ -149,7 +149,7 @@ img { max-width: 100%; display: block; }
 .nav-btn {
   background: transparent; border: 0; cursor: pointer;
   display: flex; flex-direction: column; align-items: center; gap: 2px;
-  color: var(--color-neutral-500); padding: 6px 18px; border-radius: var(--radius-md);
+  color: var(--color-neutral-500); padding: 6px 12px; border-radius: var(--radius-md);
   transition: color 140ms ease, transform 120ms ease;
 }
 .nav-btn:active { transform: scale(0.92); }
@@ -312,6 +312,32 @@ img { max-width: 100%; display: block; }
 .wish-status { align-self: flex-start; font-size: 10.5px; font-weight: 700; padding: 2px 9px; border-radius: var(--radius-pill); }
 .wish-status-saved { background: var(--color-blue); color: #245571; }
 .wish-status-tried { background: var(--color-sage); color: #3E5A2D; }
+
+/* ── salons ───────────────────────────────────────────────── */
+.section-heading { font-size: 20px; margin: var(--space-3) 0 var(--space-3); }
+.profile-card { background: var(--color-surface); border-radius: var(--radius-md); box-shadow: var(--shadow-sm); padding: var(--space-4); margin-bottom: var(--space-5); }
+.profile-summary { font-size: 14px; line-height: 1.5; color: var(--color-text-soft); margin: 0 0 var(--space-3); }
+.salon-near-input { margin-top: var(--space-2); }
+.btn-link { display: block; text-align: center; text-decoration: none; }
+.query-preview { font-size: 13px; line-height: 1.45; color: var(--color-text-soft); background: var(--color-surface-alt); border-radius: var(--radius-sm); padding: 10px var(--space-3); margin-bottom: var(--space-3); overflow-wrap: anywhere; }
+.query-preview strong { color: var(--color-text); }
+.focus-search {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--space-2);
+  background: var(--color-surface); border-radius: var(--radius-sm); box-shadow: var(--shadow-sm);
+  padding: 11px var(--space-3); margin-bottom: 6px; font-size: 13.5px; color: var(--color-text); text-decoration: none;
+}
+.focus-search span { overflow-wrap: anywhere; }
+.focus-search svg { flex: none; color: var(--color-neutral-500); }
+.salon-tip { margin: var(--space-3) 0 var(--space-2); line-height: 1.45; }
+.salon-meta { display: flex; align-items: center; gap: 5px; }
+.salon-meta .card-rating { width: 12px; height: 16px; }
+.salon-status-want { background: var(--color-blue); color: #245571; }
+.salon-status-tried { background: var(--color-sage); color: #3E5A2D; }
+.salon-status-favorite { background: var(--color-pink); color: #8E3550; }
+.salon-name { font-size: 24px; margin: var(--space-4) 0 2px; }
+.salon-neighborhood { font-size: 14px; color: var(--color-text-soft); }
+.salon-status-row { margin: var(--space-4) 0; }
+.salon-actions { padding-bottom: var(--space-4); }
 
 .link-preview { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--color-pink-700); word-break: break-all; margin-top: 4px; }
 

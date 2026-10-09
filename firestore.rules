@@ -26,6 +26,9 @@ service cloud.firestore {
       match /wishlist/{itemId} {
         allow read, write: if hash.matches('^[0-9a-f]{64}$');
       }
+      match /salons/{salonId} {
+        allow read, write: if hash.matches('^[0-9a-f]{64}$');
+      }
     }
 
     // Default-deny everything else.

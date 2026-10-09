@@ -3,6 +3,7 @@
 /* ── config ────────────────────────────────────────────────── */
 const STORAGE_KEY = "krista-nail-journal-v1";
 const CLOUD_KEY = "krista-nail-journal-cloud-hash";
+const SALON_SEARCH_KEY = "krista-nail-journal-salon-search";
 
 /* Cross-device sync via Firebase Firestore, set up once in a NEW Firebase
    project (console.firebase.google.com, free Spark tier — no billing
@@ -49,6 +50,31 @@ const RATING_TIERS = [
   { id: "meh", label: "Meh", level: 0.34, hex: "#839C69" },
   { id: "skip", label: "Skip", level: 0, hex: "#A79E96" }
 ];
+const SALON_STATUSES = [
+  { id: "want", label: "Want to try" },
+  { id: "tried", label: "Tried" },
+  { id: "favorite", label: "Favorite" }
+];
+/* How each technique reads as a Google Maps search term. Press-ons are
+   deliberately absent — they're not something to find a salon for. */
+const TECHNIQUE_SEARCH_TERMS = {
+  "Gel": "gel manicure",
+  "Acrylic": "acrylic nails",
+  "Dip Powder": "dip powder nails",
+  "Regular Polish": "manicure"
+};
+/* Styles aren't a tagged field, so they're picked out of design notes and
+   wishlist titles/notes by keyword. */
+const NAIL_STYLES = [
+  { id: "Nail Art", term: "nail art", pattern: /nail art|hand[- ]?paint|\b3d\b|charms?\b|floral|flowers?|abstract|swirl|foil|gold leaf|gems?\b|rhinestone/i },
+  { id: "Chrome", term: "chrome nails", pattern: /chrome|glazed|pearl/i },
+  { id: "French", term: "french manicure", pattern: /french/i },
+  { id: "Cat Eye", term: "cat eye nails", pattern: /cat[- ]?eye|velvet/i },
+  { id: "Ombré", term: "ombre nails", pattern: /ombr[eé]|baby boomer|gradient/i },
+  { id: "Aura", term: "aura nails", pattern: /\baura|airbrush/i },
+  { id: "Extensions", term: "gel-x extensions", pattern: /gel[- ]?x|extensions?\b|builder gel|biab/i }
+];
+const RATING_WEIGHTS = { love: 3, like: 2, meh: 0.5, skip: -1 };
 
 /* ── small helpers ─────────────────────────────────────────── */
 function uid() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
@@ -113,18 +139,33 @@ function loadStore() {
     return {
       designs: s.designs || [],
       wishlist: s.wishlist || [],
+      salons: s.salons || [],
       customColors: s.customColors || []
     };
   } catch (e) {
-    return { designs: [], wishlist: [], customColors: [] };
+    return { designs: [], wishlist: [], salons: [], customColors: [] };
   }
 }
 function saveStoreLocal() {
   try {
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify({
-      designs: state.designs, wishlist: state.wishlist, customColors: state.customColors
+      designs: state.designs, wishlist: state.wishlist, salons: state.salons, customColors: state.customColors
     }));
   } catch (e) {}
+}
+
+/* Salon-search criteria are a per-device convenience (home neighborhood,
+   last-used chips), so they live in their own key and never sync.
+   `selected` stays null until the first chip tap, meaning "use whatever
+   the nail profile suggests" — so the defaults keep tracking new designs
+   until she actually customizes them. */
+function loadSalonSearch() {
+  let s = {};
+  try { s = JSON.parse(window.localStorage.getItem(SALON_SEARCH_KEY)) || {}; } catch (e) {}
+  return Object.assign({ near: "home", home: "", other: "", selected: null, extras: "", openNow: false }, s);
+}
+function saveSalonSearch() {
+  try { window.localStorage.setItem(SALON_SEARCH_KEY, JSON.stringify(state.salonSearch)); } catch (e) {}
 }
 
 const state = Object.assign({
@@ -132,6 +173,7 @@ const state = Object.assign({
     gallery: { query: "", occasion: null, season: [], color: null, rating: null, sort: "date" },
     wishlist: { query: "", occasion: null, season: [], color: null, status: null }
   },
+  salonSearch: loadSalonSearch(),
   syncStatus: ""
 }, loadStore());
 
@@ -160,8 +202,8 @@ let unlocked = !FIREBASE_ENABLED || !REQUIRE_PASSCODE || (REQUIRE_PASSCODE && !!
    each other. Photos are embedded as base64 data: URLs on the document
    itself (see compressPhotoToDataURL below) rather than living in
    Firebase Storage, which would require the paid Blaze plan. */
-let db = null, designsColRef = null, wishlistColRef = null;
-let unsubDesigns = null, unsubWishlist = null, firebaseLoading = null, passcodeHash = null;
+let db = null, designsColRef = null, wishlistColRef = null, salonsColRef = null;
+let unsubDesigns = null, unsubWishlist = null, unsubSalons = null, firebaseLoading = null, passcodeHash = null;
 
 function ensureFirebase() {
   if (window.firebase && window.firebase.apps && window.firebase.apps.length) return Promise.resolve();
@@ -201,6 +243,7 @@ function connectCloud(hash) {
     const parent = db.collection("passcodes").doc(hash);
     designsColRef = parent.collection("designs");
     wishlistColRef = parent.collection("wishlist");
+    connectSalons(parent);
     return Promise.all([designsColRef.get(), wishlistColRef.get()]);
   }).then(function (results) {
     const designsSnap = results[0], wishlistSnap = results[1];
@@ -225,41 +268,46 @@ function connectCloud(hash) {
   });
 }
 
+/* Salons sync on their own chain so a project whose deployed rules
+   predate the salons subcollection keeps syncing designs and wishlist —
+   saved salons just stay on this device until the rules are updated. */
+function connectSalons(parent) {
+  const colRef = parent.collection("salons");
+  colRef.get().then(function (snap) {
+    const remoteIds = new Set(snap.docs.map(function (d) { return d.id; }));
+    const localOnly = state.salons.filter(function (x) { return !remoteIds.has(x.id); });
+    state.salons = mergeById(snap.docs.map(function (d) { return d.data(); }), localOnly);
+    saveStoreLocal();
+    refreshDataViews();
+    salonsColRef = colRef;
+    unsubSalons = listenToCollection(salonsColRef, "salons");
+    return Promise.all(localOnly.map(function (x) { return salonsColRef.doc(x.id).set(x); }));
+  }).catch(function () {});
+}
+
+function listenToCollection(colRef, key) {
+  return colRef.onSnapshot(function (snap) {
+    if (snap.metadata.hasPendingWrites) return;
+    snap.docChanges().forEach(function (change) {
+      if (change.type === "removed") {
+        state[key] = state[key].filter(function (x) { return x.id !== change.doc.id; });
+      } else {
+        const data = change.doc.data();
+        const idx = state[key].findIndex(function (x) { return x.id === data.id; });
+        if (idx >= 0) state[key][idx] = data; else state[key].unshift(data);
+      }
+    });
+    saveStoreLocal();
+    refreshDataViews();
+    setSyncStatus("Synced");
+  }, function () {
+    setSyncStatus("Offline — saved on this device, will sync when reconnected.");
+  });
+}
+
 function subscribeCloud() {
-  unsubDesigns = designsColRef.onSnapshot(function (snap) {
-    if (snap.metadata.hasPendingWrites) return;
-    snap.docChanges().forEach(function (change) {
-      if (change.type === "removed") {
-        state.designs = state.designs.filter(function (d) { return d.id !== change.doc.id; });
-      } else {
-        const data = change.doc.data();
-        const idx = state.designs.findIndex(function (d) { return d.id === data.id; });
-        if (idx >= 0) state.designs[idx] = data; else state.designs.unshift(data);
-      }
-    });
-    saveStoreLocal();
-    refreshDataViews();
-    setSyncStatus("Synced");
-  }, function () {
-    setSyncStatus("Offline — saved on this device, will sync when reconnected.");
-  });
-  unsubWishlist = wishlistColRef.onSnapshot(function (snap) {
-    if (snap.metadata.hasPendingWrites) return;
-    snap.docChanges().forEach(function (change) {
-      if (change.type === "removed") {
-        state.wishlist = state.wishlist.filter(function (w) { return w.id !== change.doc.id; });
-      } else {
-        const data = change.doc.data();
-        const idx = state.wishlist.findIndex(function (w) { return w.id === data.id; });
-        if (idx >= 0) state.wishlist[idx] = data; else state.wishlist.unshift(data);
-      }
-    });
-    saveStoreLocal();
-    refreshDataViews();
-    setSyncStatus("Synced");
-  }, function () {
-    setSyncStatus("Offline — saved on this device, will sync when reconnected.");
-  });
+  unsubDesigns = listenToCollection(designsColRef, "designs");
+  unsubWishlist = listenToCollection(wishlistColRef, "wishlist");
 }
 
 /* Compresses straight from the original file (not a re-encode of an
@@ -316,6 +364,19 @@ function removeWishlist(id) {
   if (wishlistColRef) wishlistColRef.doc(id).delete().catch(function () {});
   affected.forEach(function (d) { if (designsColRef) designsColRef.doc(d.id).set(d).catch(function () {}); });
 }
+function upsertSalon(salon) {
+  const idx = state.salons.findIndex(function (x) { return x.id === salon.id; });
+  if (idx >= 0) state.salons[idx] = salon; else state.salons.unshift(salon);
+  saveStoreLocal();
+  refreshDataViews();
+  if (salonsColRef) salonsColRef.doc(salon.id).set(salon).catch(function () {});
+}
+function removeSalon(id) {
+  state.salons = state.salons.filter(function (x) { return x.id !== id; });
+  saveStoreLocal();
+  refreshDataViews();
+  if (salonsColRef) salonsColRef.doc(id).delete().catch(function () {});
+}
 
 /* ── icons ─────────────────────────────────────────────────── */
 let iconCounter = 0;
@@ -351,6 +412,7 @@ function editSVG() { return '<svg viewBox="0 0 24 24" width="18" height="18" fil
 function trashSVG() { return '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"></path><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path></svg>'; }
 function cameraGlyphSVG() { return '<svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="7" width="18" height="13" rx="2"></rect><path d="M8 7l1.5-2.5h5L16 7"></path><circle cx="12" cy="13.5" r="3.5"></circle></svg>'; }
 function chevronLeftSVG() { return '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"></path></svg>'; }
+function pinSVG() { return '<svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21s-7-6.2-7-11.5a7 7 0 0 1 14 0C19 14.8 12 21 12 21z"></path><circle cx="12" cy="9.5" r="2.5"></circle></svg>'; }
 function chevronRightSVG() { return '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"></path></svg>'; }
 
 /* ── swipe gesture ─────────────────────────────────────────── */
@@ -523,7 +585,7 @@ function navigate(hash) {
   else location.hash = hash;
 }
 function updateNavActive(name, parts) {
-  const tab = name === "wishlist" ? "wishlist" : (name === "design" && parts[1] === "new") ? "add" : "gallery";
+  const tab = (name === "wishlist" || name === "salons") ? name : (name === "design" && parts[1] === "new") ? "add" : "gallery";
   document.querySelectorAll(".nav-btn").forEach(function (btn) {
     btn.classList.toggle("active", btn.dataset.nav === tab);
   });
@@ -552,10 +614,29 @@ function renderRoute() {
     title.textContent = "Wishlist";
     root.innerHTML = wishlistHTML();
     bindWishlistEvents();
+  } else if (name === "salons" && parts[1] === "add") {
+    title.textContent = "Add Salon";
+    initSalonDraft(null);
+    root.innerHTML = salonFormBodyHTML();
+    bindSalonFormEvents(null);
+  } else if (name === "salons" && parts[1] && parts[2] === "edit") {
+    title.textContent = "Edit Salon";
+    initSalonDraft(parts[1]);
+    root.innerHTML = salonFormBodyHTML();
+    bindSalonFormEvents(parts[1]);
+  } else if (name === "salons" && parts[1]) {
+    title.textContent = "Salon";
+    root.innerHTML = salonDetailHTML(parts[1]);
+    bindSalonDetailEvents(parts[1]);
+  } else if (name === "salons") {
+    title.textContent = "Salons";
+    root.innerHTML = salonsHTML();
+    bindSalonsEvents();
   } else if (name === "design" && parts[1] === "new") {
     const fromWishlistId = parts[2] === "from" ? parts[3] : null;
+    const atSalonId = parts[2] === "at" ? parts[3] : null;
     title.textContent = "Add Design";
-    initDesignDraft(null, fromWishlistId);
+    initDesignDraft(null, fromWishlistId, atSalonId);
     root.innerHTML = designFormBodyHTML();
     bindDesignFormEvents(null);
   } else if (name === "design" && parts[1] && parts[2] === "edit") {
@@ -580,6 +661,7 @@ function refreshDataViews() {
   const r = parseRoute();
   if (r.name === "gallery" && document.getElementById("gallery-grid")) updateGalleryResults();
   else if (r.name === "wishlist" && !r.parts[1] && document.getElementById("wishlist-list")) updateWishlistResults();
+  else if (r.name === "salons" && !r.parts[1] && document.getElementById("salon-list")) updateSalonList();
 }
 function notFoundHTML() {
   return '<div class="empty-state"><div class="empty-title">Not found</div><div class="empty-body">This item may have been deleted.</div></div>';
@@ -753,7 +835,7 @@ function makeDefaultDesignDraft() {
     wouldRepeat: false, wishlistId: null, notes: ""
   };
 }
-function initDesignDraft(existingId, fromWishlistId) {
+function initDesignDraft(existingId, fromWishlistId, atSalonId) {
   if (existingId) {
     const existing = state.designs.find(function (d) { return d.id === existingId; });
     formDraft = existing ? Object.assign(makeDefaultDesignDraft(), JSON.parse(JSON.stringify(existing))) : makeDefaultDesignDraft();
@@ -768,6 +850,10 @@ function initDesignDraft(existingId, fromWishlistId) {
         formDraft.colors = (w.colors || []).slice();
         formDraft.wishlistId = w.id;
       }
+    }
+    if (atSalonId) {
+      const salon = state.salons.find(function (x) { return x.id === atSalonId; });
+      if (salon) formDraft.location = salon.name;
     }
   }
 }
@@ -801,7 +887,8 @@ function designFormBodyHTML() {
       TECHNIQUES.map(function (t) { return chipHTML("technique", t, t, formDraft.technique === t, "pink", "design-single"); }).join("") + "</div></div>" +
     '<div class="form-section"><label class="form-label">Shape <span style="text-transform:none;font-weight:400;">(optional)</span></label><div class="chip-row">' +
       SHAPES.map(function (s) { return chipHTML("shape", s, s, formDraft.shape === s, "blue", "design-single"); }).join("") + "</div></div>" +
-    '<div class="form-section"><label class="form-label">Location</label><input class="form-input" id="field-location" placeholder="Salon or Home" value="' + esc(formDraft.location) + '"></div>' +
+    '<div class="form-section"><label class="form-label">Location</label><input class="form-input" id="field-location" list="salon-name-options" autocomplete="off" placeholder="Salon or Home" value="' + esc(formDraft.location) + '">' +
+      '<datalist id="salon-name-options">' + state.salons.map(function (x) { return '<option value="' + esc(x.name) + '">'; }).join("") + "</datalist></div>" +
     '<div class="form-row"><div class="form-section"><label class="form-label">Nail artist</label><input class="form-input" id="field-artist" placeholder="Optional" value="' + esc(formDraft.artistName) + '"></div>' +
       '<div class="form-section"><label class="form-label">Handle</label><input class="form-input" id="field-handle" placeholder="@handle" value="' + esc(formDraft.artistHandle) + '"></div></div>' +
     '<div class="form-section"><label class="form-label">Notes</label><textarea class="form-textarea" id="field-notes" placeholder="How\'d it go?">' + esc(formDraft.notes) + "</textarea></div>" +
@@ -878,6 +965,7 @@ function bindDesignFormEvents(existingId) {
         };
         const isNew = !existingId;
         upsertDesign(design);
+        markSalonTried(design.location);
         if (isNew && design.wishlistId) {
           const w = state.wishlist.find(function (x) { return x.id === design.wishlistId; });
           if (w) { w.status = "tried"; w.resultDesignId = design.id; upsertWishlist(w); }
@@ -1168,6 +1256,374 @@ function bindWishlistFormEvents(existingId) {
   });
 }
 
+/* ── nail profile (preferences learned from history) ───────── */
+/* Every design votes for its technique, shape and any styles its notes
+   mention, weighted by how much she liked it — a "Love" she'd repeat
+   counts far more than a "Meh", and a "Skip" counts against. Saved
+   wishlist items vote for the styles in their title/notes (that's what
+   she wants next); tried ones vote with their result design's weight. */
+function designWeight(d) {
+  const w = RATING_WEIGHTS[d.rating];
+  return (w === undefined ? 1 : w) + (d.wouldRepeat ? 1 : 0);
+}
+function buildNailProfile(designs, wishlist) {
+  const tally = { technique: {}, shape: {}, style: {} };
+  function add(kind, value, weight) {
+    const t = tally[kind][value] || (tally[kind][value] = { value: value, score: 0, count: 0 });
+    t.score += weight;
+    t.count += 1;
+  }
+  function addStyles(text, weight) {
+    NAIL_STYLES.forEach(function (st) { if (st.pattern.test(text)) add("style", st.id, weight); });
+  }
+  designs.forEach(function (d) {
+    const w = designWeight(d);
+    if (TECHNIQUE_SEARCH_TERMS[d.technique]) add("technique", d.technique, w);
+    if (d.shape) add("shape", d.shape, w);
+    addStyles(d.notes || "", w);
+  });
+  wishlist.forEach(function (item) {
+    const result = item.resultDesignId ? designs.find(function (d) { return d.id === item.resultDesignId; }) : null;
+    addStyles([item.title, item.notes].filter(Boolean).join(" "), result ? designWeight(result) : 1.5);
+  });
+  function ranked(kind) {
+    return Object.keys(tally[kind]).map(function (k) { return tally[kind][k]; })
+      .filter(function (t) { return t.score > 0; })
+      .sort(function (a, b) { return b.score - a.score || b.count - a.count; });
+  }
+  return {
+    technique: ranked("technique"), shape: ranked("shape"), style: ranked("style"),
+    designCount: designs.length, wishCount: wishlist.length
+  };
+}
+function plural(n, word) { return n + " " + word + (n === 1 ? "" : "s"); }
+/* Names the top pick, plus the runner-up only when it's a real contender
+   (a lone "Meh" shouldn't read as something she's "mostly" into). */
+function topNames(list) {
+  return list.slice(0, 2).filter(function (t, i) { return i === 0 || t.score >= list[0].score / 2; })
+    .map(function (t) { return t.value; }).join(" & ");
+}
+function profileSummaryText(p) {
+  const parts = [];
+  if (p.technique.length) parts.push("mostly " + topNames(p.technique));
+  if (p.shape.length) parts.push(p.shape[0].value + " shape");
+  if (p.style.length) parts.push("into " + topNames(p.style));
+  if (!parts.length) return "Log and rate a few designs and this will learn what you like. For now, pick what you're after.";
+  const sources = [plural(p.designCount, "design")];
+  if (p.wishCount) sources.push(plural(p.wishCount, "wishlist item"));
+  return "From your " + sources.join(" and ") + ": " + parts.join(", ") + ".";
+}
+
+/* ── salon search (Google Maps links) ──────────────────────── */
+const SALON_TERM_GROUPS = [
+  { kind: "technique", label: "Technique", tone: "pink", options: Object.keys(TECHNIQUE_SEARCH_TERMS) },
+  { kind: "style", label: "Style", tone: "sage", options: NAIL_STYLES.map(function (st) { return st.id; }) },
+  { kind: "shape", label: "Shape", tone: "blue", options: SHAPES }
+];
+function defaultSalonTerms(profile) {
+  const keys = [];
+  if (profile.technique[0]) keys.push("technique:" + profile.technique[0].value);
+  if (profile.style[0]) keys.push("style:" + profile.style[0].value);
+  return keys;
+}
+function selectedSalonTerms(profile) {
+  return state.salonSearch.selected || defaultSalonTerms(profile);
+}
+function salonSearchTerm(key) {
+  const i = key.indexOf(":"), kind = key.slice(0, i), value = key.slice(i + 1);
+  if (kind === "technique") return TECHNIQUE_SEARCH_TERMS[value] || "";
+  if (kind === "style") {
+    const st = NAIL_STYLES.find(function (x) { return x.id === value; });
+    return st ? st.term : "";
+  }
+  if (kind === "shape") return SHAPES.indexOf(value) >= 0 ? value.toLowerCase() + " nails" : "";
+  return "";
+}
+/* "near me" lets the Maps app use the phone's own location, so "where I
+   am" needs no geolocation permission here — and it's also the fallback
+   when the home/other field is still blank. */
+function salonPlacePhrase(s) {
+  const place = s.near === "home" ? s.home.trim() : s.near === "other" ? s.other.trim() : "";
+  return place ? "near " + place : "near me";
+}
+function buildSalonQueries(s, selectedKeys) {
+  const order = SALON_TERM_GROUPS.map(function (g) { return g.kind; });
+  const terms = selectedKeys.slice()
+    .sort(function (a, b) { return order.indexOf(a.split(":")[0]) - order.indexOf(b.split(":")[0]); })
+    .map(salonSearchTerm).filter(Boolean);
+  const extras = s.extras.trim();
+  const suffix = " " + salonPlacePhrase(s) + (s.openNow ? " open now" : "");
+  const main = ["nail salon"].concat(terms, extras ? [extras] : []).join(" ") + suffix;
+  const focused = terms.length > 1 ? terms.map(function (t) { return t + suffix; }) : [];
+  return { main: main, focused: focused };
+}
+function mapsSearchUrl(query) {
+  return "https://www.google.com/maps/search/?api=1&query=" + encodeURIComponent(query);
+}
+function safeHttpUrl(url) {
+  return /^https?:\/\//i.test(url || "") ? url : "";
+}
+
+/* ── saved salons ──────────────────────────────────────────── */
+/* Designs link to a salon by name (the design's Location field), so
+   designs logged before the salon was saved still count, and nothing
+   needs re-linking if a salon is deleted. */
+function normalizeName(str) { return String(str || "").toLowerCase().replace(/\s+/g, " ").trim(); }
+function designsAtSalon(salon) {
+  const n = normalizeName(salon.name);
+  if (!n) return [];
+  return sortDesigns(state.designs.filter(function (d) { return normalizeName(d.location) === n; }), "date");
+}
+function markSalonTried(location) {
+  const n = normalizeName(location);
+  if (!n) return;
+  state.salons.filter(function (x) { return x.status === "want" && normalizeName(x.name) === n; })
+    .forEach(function (x) { upsertSalon(Object.assign({}, x, { status: "tried", updatedAt: Date.now() })); });
+}
+function salonStatusLabel(status) {
+  const cfg = SALON_STATUSES.find(function (x) { return x.id === status; });
+  return cfg ? cfg.label : "Want to try";
+}
+function salonStatusPillHTML(status) {
+  return '<span class="wish-status salon-status-' + esc(status || "want") + '">' + esc(salonStatusLabel(status)) + "</span>";
+}
+function salonMapsUrl(salon) {
+  return safeHttpUrl(salon.mapsUrl) || mapsSearchUrl([salon.name, salon.neighborhood].filter(Boolean).join(" "));
+}
+function getSalonOrderedList() {
+  const rank = { favorite: 0, want: 1, tried: 2 };
+  return state.salons.slice().sort(function (a, b) {
+    return (rank[a.status] === undefined ? 1 : rank[a.status]) - (rank[b.status] === undefined ? 1 : rank[b.status]) ||
+      (a.name || "").localeCompare(b.name || "");
+  });
+}
+
+/* ── salons tab ────────────────────────────────────────────── */
+function salonsHTML() {
+  const s = state.salonSearch;
+  const profile = buildNailProfile(state.designs, state.wishlist);
+  const selected = selectedSalonTerms(profile);
+  const termGroups = SALON_TERM_GROUPS.map(function (g) {
+    const byValue = {};
+    profile[g.kind].forEach(function (t) { byValue[t.value] = t; });
+    const options = g.options.slice().sort(function (a, b) {
+      return ((byValue[b] || {}).score || 0) - ((byValue[a] || {}).score || 0) || g.options.indexOf(a) - g.options.indexOf(b);
+    });
+    return '<div class="filter-group"><div class="filter-label">' + g.label + '</div><div class="chip-row">' +
+      options.map(function (v) {
+        const label = v + (byValue[v] ? " · " + byValue[v].count : "");
+        return chipHTML(g.kind, v, label, selected.indexOf(g.kind + ":" + v) >= 0, g.tone, "salon-term");
+      }).join("") + "</div></div>";
+  }).join("");
+  return "" +
+    '<h2 class="section-heading">Find a salon</h2>' +
+    '<div class="profile-card">' +
+      '<div class="form-label">What you&rsquo;re after</div>' +
+      '<p class="profile-summary">' + esc(profileSummaryText(profile)) + "</p>" +
+      termGroups +
+      '<div class="field-hint">Numbers show how often each one turns up in designs you liked and your wishlist.</div>' +
+    "</div>" +
+    '<div class="form-section"><label class="form-label">Near</label><div class="chip-row">' +
+      [["home", "Home"], ["me", "Where I am"], ["other", "Somewhere else"]].map(function (p) {
+        return chipHTML("near", p[0], p[1], s.near === p[0], "neutral", "salon-near");
+      }).join("") + "</div>" +
+      '<input class="form-input salon-near-input" id="salon-home" placeholder="Home neighborhood or cross streets, e.g. Williamsburg, Brooklyn" value="' + esc(s.home) + '"' + (s.near === "home" ? "" : " hidden") + ">" +
+      '<input class="form-input salon-near-input" id="salon-other" placeholder="Neighborhood, address or landmark" value="' + esc(s.other) + '"' + (s.near === "other" ? "" : " hidden") + ">" +
+    "</div>" +
+    '<div class="form-section"><label class="form-label">Anything else?</label>' +
+      '<input class="form-input" id="salon-extras" placeholder="e.g. pedicure, walk-ins, non-toxic" value="' + esc(s.extras) + '"></div>' +
+    '<div class="form-section"><div class="toggle-row"><span>Open now</span><label class="switch">' +
+      '<input type="checkbox" id="salon-open-now"' + (s.openNow ? " checked" : "") + '><span class="switch-track"></span><span class="switch-thumb"></span></label></div></div>' +
+    '<div id="salon-search-output"></div>' +
+    '<h2 class="section-heading">My salons</h2>' +
+    '<div class="filters-bar"><span class="result-line" id="salon-result-line"></span>' +
+      '<button type="button" class="btn-text" id="salon-add-btn">+ Add salon</button></div>' +
+    '<div id="salon-list"></div>';
+}
+function updateSalonSearchOutput() {
+  const profile = buildNailProfile(state.designs, state.wishlist);
+  const q = buildSalonQueries(state.salonSearch, selectedSalonTerms(profile));
+  document.getElementById("salon-search-output").innerHTML = "" +
+    '<div class="query-preview">Searches Google Maps for <strong>&ldquo;' + esc(q.main) + "&rdquo;</strong></div>" +
+    '<a class="btn btn-primary btn-block btn-link" href="' + esc(mapsSearchUrl(q.main)) + '" target="_blank" rel="noopener">Search Google Maps</a>' +
+    (q.focused.length ? '<div class="form-label" style="margin-top:var(--space-4);">Or one thing at a time</div>' +
+      q.focused.map(function (f) {
+        return '<a class="focus-search" href="' + esc(mapsSearchUrl(f)) + '" target="_blank" rel="noopener"><span>' + esc(f) + "</span>" + chevronRightSVG() + "</a>";
+      }).join("") : "") +
+    '<div class="field-hint salon-tip">Tip: in Maps, tap <strong>Rating</strong> to show 4.5&#9733; and up, and skim the newest reviews for mentions of what you like. Found a keeper? Save it below.</div>';
+}
+function salonCardHTML(salon) {
+  const visits = designsAtSalon(salon);
+  const withPhoto = visits.find(function (d) { return d.photoUrl; });
+  const best = sortDesigns(visits.filter(function (d) { return d.rating; }), "rating")[0];
+  const thumb = withPhoto
+    ? '<img class="wish-thumb fade-img" src="' + esc(withPhoto.photoUrl) + '" loading="lazy" alt="">'
+    : '<div class="wish-thumb-empty">' + pinSVG() + "</div>";
+  const meta = [salon.neighborhood, visits.length ? plural(visits.length, "design") : ""].filter(Boolean).join(" · ");
+  return '<div class="wish-card" data-open-salon="' + salon.id + '">' + thumb +
+    '<div class="wish-body">' + salonStatusPillHTML(salon.status) +
+    '<div class="wish-title">' + esc(salon.name || "Untitled") + "</div>" +
+    '<div class="wish-meta salon-meta">' + (best ? ratingIconSVG(best.rating, 12, "card-rating") : "") + "<span>" + esc(meta) + "</span></div></div></div>";
+}
+function updateSalonList() {
+  const list = getSalonOrderedList();
+  document.getElementById("salon-result-line").textContent = plural(list.length, "salon");
+  const container = document.getElementById("salon-list");
+  if (!list.length) {
+    container.innerHTML = '<div class="empty-state"><div class="empty-title">No saved salons yet</div>' +
+      '<div class="empty-body">When a place looks promising in Maps, add it here so you remember to try it.</div></div>';
+    return;
+  }
+  container.innerHTML = list.map(salonCardHTML).join("");
+}
+function bindSalonsEvents() {
+  updateSalonSearchOutput();
+  updateSalonList();
+  const root = document.getElementById("view-root");
+  const s = state.salonSearch;
+  function changed() { saveSalonSearch(); updateSalonSearchOutput(); }
+  root.querySelectorAll('[data-chip-mode="salon-term"]').forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      const key = btn.dataset.chipGroup + ":" + btn.dataset.chipValue;
+      const sel = selectedSalonTerms(buildNailProfile(state.designs, state.wishlist)).slice();
+      const i = sel.indexOf(key);
+      if (i >= 0) sel.splice(i, 1); else sel.push(key);
+      s.selected = sel;
+      btn.classList.toggle("active", i < 0);
+      changed();
+    });
+  });
+  root.querySelectorAll('[data-chip-mode="salon-near"]').forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      s.near = btn.dataset.chipValue;
+      root.querySelectorAll('[data-chip-mode="salon-near"]').forEach(function (b) { b.classList.toggle("active", b === btn); });
+      document.getElementById("salon-home").hidden = s.near !== "home";
+      document.getElementById("salon-other").hidden = s.near !== "other";
+      changed();
+    });
+  });
+  document.getElementById("salon-home").addEventListener("input", function (e) { s.home = e.target.value; changed(); });
+  document.getElementById("salon-other").addEventListener("input", function (e) { s.other = e.target.value; changed(); });
+  document.getElementById("salon-extras").addEventListener("input", function (e) { s.extras = e.target.value; changed(); });
+  document.getElementById("salon-open-now").addEventListener("change", function (e) { s.openNow = e.target.checked; changed(); });
+  document.getElementById("salon-add-btn").addEventListener("click", function () { navigate("#/salons/add"); });
+  document.getElementById("salon-list").addEventListener("click", function (e) {
+    const card = e.target.closest("[data-open-salon]");
+    if (card) navigate("#/salons/" + card.dataset.openSalon);
+  });
+}
+
+/* ── salon detail ──────────────────────────────────────────── */
+function salonDetailHTML(id) {
+  const salon = state.salons.find(function (x) { return x.id === id; });
+  if (!salon) return notFoundHTML();
+  const visits = designsAtSalon(salon);
+  return '<div class="detail-topbar"><button class="icon-btn" id="detail-back" aria-label="Back">' + backArrowSVG() + "</button>" +
+      '<div style="display:flex;gap:8px;"><button class="icon-btn" id="detail-edit" aria-label="Edit">' + editSVG() + "</button>" +
+      '<button class="icon-btn" id="detail-delete" aria-label="Delete">' + trashSVG() + "</button></div></div>" +
+    '<h2 class="salon-name">' + esc(salon.name) + "</h2>" +
+    (salon.neighborhood ? '<div class="salon-neighborhood">' + esc(salon.neighborhood) + "</div>" : "") +
+    '<div class="chip-row salon-status-row">' +
+      SALON_STATUSES.map(function (st) { return chipHTML("status", st.id, st.label, (salon.status || "want") === st.id, "pink", "salon-status"); }).join("") + "</div>" +
+    '<div class="detail-actions salon-actions">' +
+      '<a class="btn btn-primary btn-link" href="' + esc(salonMapsUrl(salon)) + '" target="_blank" rel="noopener">Open in Maps</a>' +
+      '<button type="button" class="btn btn-secondary" id="salon-log-design">Log a design here</button></div>' +
+    (salon.notes ? '<div class="detail-notes">' + esc(salon.notes).replace(/\n/g, "<br>") + "</div>" : "") +
+    '<div class="filter-label">Your designs here</div>' +
+    (visits.length
+      ? '<div class="grid">' + visits.map(designCardHTML).join("") + "</div>"
+      : '<div class="field-hint" style="margin-bottom:var(--space-4);">Designs logged with the location &ldquo;' + esc(salon.name) + "&rdquo; will show up here.</div>") +
+    '<div class="detail-field"><div class="detail-field-label">Saved</div><div class="detail-field-value">' + esc(formatDate(salon.dateAdded)) + "</div></div>";
+}
+function bindSalonDetailEvents(id) {
+  const salon = state.salons.find(function (x) { return x.id === id; });
+  if (!salon) return;
+  document.getElementById("detail-back").addEventListener("click", function () { navigate("#/salons"); });
+  document.getElementById("detail-edit").addEventListener("click", function () { navigate("#/salons/" + id + "/edit"); });
+  document.getElementById("detail-delete").addEventListener("click", function () {
+    showConfirmSheet("Remove this salon? Your designs from there stay in your gallery.", "Remove", function () {
+      removeSalon(id);
+      navigate("#/salons");
+      showToast("Salon removed");
+    });
+  });
+  document.getElementById("view-root").querySelectorAll('[data-chip-mode="salon-status"]').forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      upsertSalon(Object.assign({}, salon, { status: btn.dataset.chipValue, updatedAt: Date.now() }));
+      renderRoute();
+    });
+  });
+  document.getElementById("salon-log-design").addEventListener("click", function () { navigate("#/design/new/at/" + id); });
+  const grid = document.querySelector("#view-root .grid");
+  if (grid) grid.addEventListener("click", function (e) {
+    const card = e.target.closest("[data-open-design]");
+    if (card) navigate("#/design/" + card.dataset.openDesign);
+  });
+}
+
+/* ── add / edit salon ──────────────────────────────────────── */
+let salonDraft = null;
+function makeDefaultSalonDraft() {
+  return { id: uid(), name: "", neighborhood: "", mapsUrl: "", status: "want", notes: "", dateAdded: todayISO() };
+}
+function initSalonDraft(existingId) {
+  const existing = existingId ? state.salons.find(function (x) { return x.id === existingId; }) : null;
+  salonDraft = Object.assign(makeDefaultSalonDraft(), existing ? JSON.parse(JSON.stringify(existing)) : {});
+}
+function salonFormBodyHTML() {
+  return "" +
+    '<div class="form-section"><label class="form-label">Name</label><input class="form-input" id="field-salon-name" placeholder="e.g. Glossy Nail Studio" value="' + esc(salonDraft.name) + '"></div>' +
+    '<div class="form-section"><label class="form-label">Neighborhood or address</label><input class="form-input" id="field-salon-hood" placeholder="e.g. Williamsburg" value="' + esc(salonDraft.neighborhood) + '"></div>' +
+    '<div class="form-section"><label class="form-label">Google Maps link</label><input class="form-input" id="field-salon-maps" type="url" placeholder="https://maps.app.goo.gl/…" value="' + esc(salonDraft.mapsUrl) + '">' +
+      '<div class="field-hint">Optional. In Google Maps, tap Share &rarr; Copy link, then paste it here.</div></div>' +
+    '<div class="form-section"><label class="form-label">Status</label><div class="chip-row">' +
+      SALON_STATUSES.map(function (st) { return chipHTML("status", st.id, st.label, salonDraft.status === st.id, "pink", "salon-form-status"); }).join("") + "</div></div>" +
+    '<div class="form-section"><label class="form-label">Notes</label><textarea class="form-textarea" id="field-salon-notes" placeholder="Prices, who to book with, what reviews said…">' + esc(salonDraft.notes) + "</textarea></div>" +
+    '<div class="form-actions"><button type="button" class="btn btn-outline" id="salon-form-cancel">Cancel</button><button type="button" class="btn btn-primary" id="salon-form-save">Save</button></div>';
+}
+function bindSalonFormEvents(existingId) {
+  const root = document.getElementById("view-root");
+  document.getElementById("field-salon-name").addEventListener("input", function (e) { salonDraft.name = e.target.value; });
+  document.getElementById("field-salon-hood").addEventListener("input", function (e) { salonDraft.neighborhood = e.target.value; });
+  document.getElementById("field-salon-maps").addEventListener("input", function (e) { salonDraft.mapsUrl = e.target.value; });
+  document.getElementById("field-salon-notes").addEventListener("input", function (e) { salonDraft.notes = e.target.value; });
+  root.querySelectorAll('[data-chip-mode="salon-form-status"]').forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      salonDraft.status = btn.dataset.chipValue;
+      root.querySelectorAll('[data-chip-mode="salon-form-status"]').forEach(function (b) { b.classList.toggle("active", b === btn); });
+    });
+  });
+  document.getElementById("salon-form-cancel").addEventListener("click", function () {
+    salonDraft = null;
+    navigate(existingId ? "#/salons/" + existingId : "#/salons");
+  });
+  document.getElementById("salon-form-save").addEventListener("click", function () {
+    const name = salonDraft.name.trim();
+    const nameField = document.getElementById("field-salon-name");
+    if (!name) {
+      showToast("Give it a name first.", { error: true });
+      shakeField(nameField);
+      nameField.focus();
+      return;
+    }
+    const mapsUrl = salonDraft.mapsUrl.trim();
+    if (mapsUrl && !safeHttpUrl(mapsUrl)) {
+      showToast("That Maps link should start with https://", { error: true });
+      shakeField(document.getElementById("field-salon-maps"));
+      return;
+    }
+    const salon = {
+      id: salonDraft.id, name: name, neighborhood: salonDraft.neighborhood.trim(), mapsUrl: mapsUrl,
+      status: salonDraft.status || "want", notes: salonDraft.notes, dateAdded: salonDraft.dateAdded || todayISO(),
+      updatedAt: Date.now()
+    };
+    upsertSalon(salon);
+    salonDraft = null;
+    navigate("#/salons/" + salon.id);
+    showToast(existingId ? "Salon updated" : "Salon saved");
+  });
+}
+
 /* ── lock screen ───────────────────────────────────────────── */
 function showApp() {
   document.getElementById("lock-screen").hidden = true;
@@ -1197,6 +1653,7 @@ function submitPasscode() {
 function lockAgain() {
   if (unsubDesigns) unsubDesigns();
   if (unsubWishlist) unsubWishlist();
+  if (unsubSalons) unsubSalons();
   try { window.localStorage.removeItem(CLOUD_KEY); } catch (e) {}
   location.reload();
 }

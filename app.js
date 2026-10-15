@@ -1466,7 +1466,9 @@ function placesCountCall() {
 function placesRequest(path, fieldMask, body) {
   if (placesCallsLeft() < 1) { const e = new Error("daily limit"); e.code = "limit"; return Promise.reject(e); }
   placesCountCall();
-  const init = { headers: { "X-Goog-Api-Key": PLACES_API_KEY, "X-Goog-FieldMask": fieldMask } };
+  /* The key is locked to this site by the Referer header, so ask for it to
+     be sent explicitly rather than relying on each browser's default. */
+  const init = { headers: { "X-Goog-Api-Key": PLACES_API_KEY, "X-Goog-FieldMask": fieldMask }, referrerPolicy: "strict-origin-when-cross-origin" };
   if (body) {
     init.method = "POST";
     init.headers["Content-Type"] = "application/json";
@@ -1484,7 +1486,10 @@ function placesRequest(path, fieldMask, body) {
 function friendlyPlacesError(err) {
   if (err.friendly) return err.friendly;
   if (err.code === "limit") return "That's today's search limit for this app (a safety cap to avoid charges). Try again tomorrow, or use Google Maps below.";
-  if (err.status === 401 || err.status === 403) return "Google turned the request down (" + err.status + "). Check that the API key allows this website and the Places API (New).";
+  if (err.status === 401 || err.status === 403) {
+    return "Google turned the request down (" + err.status + "): " + String(err.message).slice(0, 160) +
+      " This app is open at " + window.location.origin + " — the API key only allows the addresses it was set up for.";
+  }
   if (err.status === 429) return "Too many searches at once — wait a minute and try again.";
   if (err.status) return "Google couldn't run that search (" + err.status + "): " + String(err.message).slice(0, 140);
   return "Couldn't reach Google — check your connection and try again.";
